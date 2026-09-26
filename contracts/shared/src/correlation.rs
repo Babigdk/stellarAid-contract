@@ -40,7 +40,7 @@ impl CorrelationId {
         let mut buf = Bytes::new(env);
         buf.append(scope);
         for part in parts {
-            let len = part.len() as u32;
+            let len = part.len();
             buf.append(&Bytes::from_array(env, &len.to_be_bytes()));
             buf.append(part);
         }

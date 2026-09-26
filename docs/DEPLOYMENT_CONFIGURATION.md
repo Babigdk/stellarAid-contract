@@ -63,7 +63,7 @@ Use these settings for Stellar mainnet deployments:
 
 ### Mainnet Prerequisites
 - Pre-fund admin/operator accounts with sufficient XLM (minimum 1000 XLM recommended for deployment)
-- Configure emergency multisig with at least 3/5 signers
+- Configure emergency multisig with at least 3/5 signers (see [ADMIN_MULTISIG.md](ADMIN_MULTISIG.md) for full configuration and verification runbook)
 - Set up monitoring and alerting before deployment
 - Perform a full staging deployment on testnet first
 
