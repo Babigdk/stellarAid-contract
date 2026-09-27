@@ -152,17 +152,17 @@ fn is_paused(env: &Env) -> bool {
 }
 
 pub fn get_metrics(env: &Env) -> HealthMetrics {
-    let mut metrics: HealthMetrics = env
-        .storage()
-        .instance()
-        .get(&HealthKey::Metrics)
-        .unwrap_or(HealthMetrics {
-            ok_count: 0,
-            error_count: 0,
-            last_ok_ledger: 0,
-            last_error_ledger: 0,
-            paused: false,
-        });
+    let mut metrics: HealthMetrics =
+        env.storage()
+            .instance()
+            .get(&HealthKey::Metrics)
+            .unwrap_or(HealthMetrics {
+                ok_count: 0,
+                error_count: 0,
+                last_ok_ledger: 0,
+                last_error_ledger: 0,
+                paused: false,
+            });
     metrics.paused = is_paused(env);
     metrics
 }
@@ -187,6 +187,7 @@ pub fn record_error(env: &Env) {
     save_metrics(env, &metrics);
 }
 
+#[allow(clippy::manual_checked_ops)]
 pub fn error_bps(metrics: &HealthMetrics) -> u32 {
     let total = (metrics.ok_count as u128).saturating_add(metrics.error_count as u128);
     if total == 0 {
@@ -209,10 +210,7 @@ pub fn is_stalled(env: &Env, metrics: &HealthMetrics, config: &AlertConfig) -> b
     if last == 0 {
         return false;
     }
-    env.ledger()
-        .sequence()
-        .saturating_sub(last)
-        >= config.stall_ledgers
+    env.ledger().sequence().saturating_sub(last) >= config.stall_ledgers
 }
 
 pub fn classify(env: &Env, metrics: &HealthMetrics, config: &AlertConfig) -> (HealthStatus, bool) {

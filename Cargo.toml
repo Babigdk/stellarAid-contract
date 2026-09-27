@@ -23,6 +23,7 @@ members = [
     "contracts/ecosystem_funding",
     "contracts/licensing",
     "contracts/mentorship",
+    "contracts/campaign",
     "sdk",
     "tests/framework",
     "tests/upgrade_testing",

@@ -58,11 +58,7 @@ for the companion PR*, not as something you can use today.
 | Any other address | **no** | `pause` compares against the stored admin and returns `Unauthorized` |
 | Anyone with the admin *key* | yes | Keys are held in a secret manager, never in this repo |
 
-There is no multi-signature today. **If the admin key is lost, there is no
-on-chain path to pause or resume.** That is a single point of failure and is the
-main motivation for #711. Until it lands, the mitigation is operational: two
-operators, an escrowed offline backup of the admin key, and a rehearsed
-rotation.
+*Note on Multi-Signature Support:* Administrative actions natively support M-of-N multi-signature Stellar accounts and contract wallets with zero contract redesign (see [ADMIN_MULTISIG.md](ADMIN_MULTISIG.md)). In addition, the Campaign contract supports emergency contract freezing (`freeze()` / `unfreeze()`) and campaign fraud-review flagging (`flag_for_review(reason_hash)` / `clear_review_flag()`) to immediately halt withdrawals pending investigation.
 
 Which address is the admin differs per contract:
 

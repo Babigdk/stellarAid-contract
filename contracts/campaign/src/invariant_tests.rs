@@ -8,8 +8,8 @@
 
 #![cfg(test)]
 
-use soroban_sdk::{testutils::Address as _, Address, BytesN, Env, Symbol};
-use crate::{CampaignContract, DataKey};
+use crate::CampaignContract;
+use soroban_sdk::{testutils::Address as _, Address, Env};
 
 /// Simulates tracking raised/withdrawn locally to validate the invariant
 /// raised >= withdrawn (no overdraft).
@@ -24,7 +24,10 @@ fn test_invariant_raised_never_below_withdrawn() {
     // Even after multiple withdrawals
     let withdrawn2 = 60_000;
     let remaining2 = raised - (withdrawn + withdrawn2);
-    assert!(remaining2 >= 0, "remaining must be non-negative after second withdrawal");
+    assert!(
+        remaining2 >= 0,
+        "remaining must be non-negative after second withdrawal"
+    );
     assert_eq!(remaining2, 0);
 }
 
@@ -90,7 +93,10 @@ fn test_invariant_no_overflow_on_accumulation() {
     let c: i128 = i128::MAX / 3;
 
     let sum = a.checked_add(b).and_then(|v| v.checked_add(c));
-    assert!(sum.is_some(), "sum of 3 equal partitions of i128::MAX must not overflow");
+    assert!(
+        sum.is_some(),
+        "sum of 3 equal partitions of i128::MAX must not overflow"
+    );
     assert_eq!(sum.unwrap(), i128::MAX / 3 * 3);
 }
 
@@ -109,7 +115,10 @@ fn test_invariant_raised_monotonic() {
     let refund_amount = 10_000;
     raised -= refund_amount;
     assert_eq!(raised, 30_000);
-    assert!(raised >= 0, "raised must stay non-negative even after refund");
+    assert!(
+        raised >= 0,
+        "raised must stay non-negative even after refund"
+    );
 }
 
 /// Campaign count is consistent with actual stored campaigns.

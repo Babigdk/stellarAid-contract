@@ -2,8 +2,6 @@
 name = "reputation"
 version.workspace = true
 edition.workspace = true
-version = "0.1.0"
-edition = "2021"
 
 [package.metadata.stellar-aid]
 versioning = "semver"

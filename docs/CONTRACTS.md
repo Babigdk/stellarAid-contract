@@ -86,8 +86,36 @@ Sets campaign status to `Suspended`.
 #### `get_campaign_count() -> u64`
 Returns total number of campaigns created.
 
+#### `freeze()`
+Admin-only. Emergency freezes the contract, halting all state-changing activities and emitting `contract_frozen`.
+
+#### `unfreeze()`
+Admin-only. Restores contract operations and emits `contract_unfrozen`.
+
+#### `is_frozen() -> bool`
+Queries whether the contract is currently frozen.
+
+#### `set_admin(new_admin: Address)`
+Rotates the admin address with dual authorization (`current_admin.require_auth()` and `new_admin.require_auth()`), emits `admin_changed`, and enforces exactly one admin in storage. Supports native Stellar multi-sig accounts (see [ADMIN_MULTISIG.md](ADMIN_MULTISIG.md)).
+
 #### `transfer_admin(current_admin: Address, new_admin: Address)`
 Transfers admin role to a new address.
+
+#### `flag_for_review(reason_hash: BytesN<32>)`
+Admin-only. Flags the campaign contract as under fraud review (`DataKey::UnderReview`) and stores `reason_hash`, blocking all withdrawal finalizations.
+*Note:* This is currently a manual admin action for Phase 4 fraud scoring readiness. The actual automated AI fraud-scoring system (Phase 4) is out of scope for the on-chain smart contract and interacts with this hook via an authorized off-chain service/oracle.
+
+#### `clear_review_flag()`
+Admin-only. Clears the `UnderReview` flag and removes the associated reason hash, restoring withdrawal capabilities once investigation is complete.
+
+#### `is_under_review() -> bool`
+Queries whether the contract is currently flagged under fraud review.
+
+#### `get_review_reason() -> Option<BytesN<32>>`
+Returns the 32-byte cryptographic reason hash associated with the active fraud review, if any.
+
+#### `finalize_withdrawal(campaign_id: u64, amount: i128)`
+Deducts `amount` from `campaign.raised`. Requires campaign owner authorization. Panics with `UnderReview` if the contract is flagged for fraud review, `ContractFrozen` if frozen, or when paused.
 
 #### `upgrade(admin: Address, new_wasm_hash: BytesN<32>)`
 Upgrades contract WASM.
