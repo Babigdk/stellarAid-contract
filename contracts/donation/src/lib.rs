@@ -8,6 +8,9 @@ use shared::pause;
 #[contractclient(name = "CampaignContractClient")]
 trait CampaignContractTrait {
     fn update_raised(env: Env, campaign_id: u64, amount: i128);
+    /// Registers the donor so the campaign contract can enforce the
+    /// "donor or creator" rule for disputes (#763).
+    fn record_donor(env: Env, campaign_id: u64, donor: Address);
     /// Canonical donation entry point: debits `raised` and emits
     /// `donation_received` (#756). Preferred over `update_raised` because the
     /// event carries the donor, the asset code and the new running total.
@@ -115,6 +118,22 @@ impl DonationContract {
             donor.clone()
         };
 
+        // #765: the memo is persisted inside `Donation`, so it must be bounded
+        // before the write. An unbounded per-donation string is a permanent
+        // storage liability for whoever sent it.
+        let memo = match memo {
+            Some(m) => {
+                if m.len() > shared::validation::MAX_MEMO_LEN {
+                    panic!(
+                        "memo exceeds maximum length of {} bytes",
+                        shared::validation::MAX_MEMO_LEN
+                    );
+                }
+                Some(m)
+            }
+            None => None,
+        };
+
         let timestamp = env.ledger().timestamp();
         let donation = Donation {
             donor: effective_donor.clone(),
@@ -151,6 +170,9 @@ impl DonationContract {
             .set(&DataKey::CampaignRaised(campaign_id), &new_total);
 
         campaign_client.update_raised(&campaign_id, &amount);
+        // Register the donor only after the transfer has settled, so the
+        // "donor or creator" dispute rule cannot be claimed without paying (#763).
+        campaign_client.record_donor(&campaign_id, &effective_donor);
         guard::release(&env);
         // `record_donation` updates the campaign's `raised` total and emits
         // `donation_received` from the campaign contract, so the event and the
@@ -227,7 +249,15 @@ impl DonationContract {
             .persistent()
             .set(&DataKey::CampaignRaised(campaign_id), &new_total);
 
+        // #764: verify the contract's balance before the transfer. The debit
+        // above is already persisted at this point, so an unverified transfer
+        // would leave the running total short of what the donor is owed.
         let token_client = token::Client::new(&env, &token);
+        if token_client.balance(&env.current_contract_address()) < amount {
+            // Named to match `campaign::balance::INSUFFICIENT_CONTRACT_BALANCE`
+            // and the typed `Error::InsufficientContractBalance`.
+            panic!("InsufficientContractBalance");
+        }
         token_client.transfer(&env.current_contract_address(), &donor, &amount);
 
         guard::release(&env);
@@ -267,7 +297,9 @@ impl DonationContract {
         }
     }
 
-    // ── Health monitoring (#678) and gradual rollout (#684) ──────────────
+// ── Health monitoring (#678) and gradual rollout (#684) ──────────────
+// Authorization: every setter in this block is admin-only and is enforced by
+// an identity check against the admin stored at initialization (#763).
     pub fn health_check(env: Env) -> shared::health::HealthReport {
         let report = shared::health::health_check(&env);
         if report.anomaly {
@@ -284,6 +316,10 @@ impl DonationContract {
     }
     pub fn set_alert_config(env: Env, admin: Address, config: shared::health::AlertConfig) {
         admin.require_auth();
+        // #763: `admin.require_auth()` alone accepts *any* address. Without this
+        // identity check against the stored admin, any account can reach this
+        // entry point by naming itself as `admin`.
+        Self::ensure_admin(&env, &admin);
         shared::health::set_alert_config(&env, config);
     }
     pub fn get_alert_config(env: Env) -> shared::health::AlertConfig {
@@ -294,14 +330,26 @@ impl DonationContract {
     }
     pub fn report_ok(env: Env, admin: Address) {
         admin.require_auth();
+        // #763: `admin.require_auth()` alone accepts *any* address. Without this
+        // identity check against the stored admin, any account can reach this
+        // entry point by naming itself as `admin`.
+        Self::ensure_admin(&env, &admin);
         shared::health::record_ok(&env);
     }
     pub fn report_error(env: Env, admin: Address) {
         admin.require_auth();
+        // #763: `admin.require_auth()` alone accepts *any* address. Without this
+        // identity check against the stored admin, any account can reach this
+        // entry point by naming itself as `admin`.
+        Self::ensure_admin(&env, &admin);
         shared::health::record_error(&env);
     }
     pub fn set_feature_flag(env: Env, admin: Address, flag: soroban_sdk::Symbol, enabled: bool) {
         admin.require_auth();
+        // #763: `admin.require_auth()` alone accepts *any* address. Without this
+        // identity check against the stored admin, any account can reach this
+        // entry point by naming itself as `admin`.
+        Self::ensure_admin(&env, &admin);
         shared::rollout::set_feature_flag(&env, &flag, enabled);
     }
     pub fn is_feature_enabled(env: Env, flag: soroban_sdk::Symbol) -> bool {
@@ -309,6 +357,10 @@ impl DonationContract {
     }
     pub fn set_canary_deployment(env: Env, admin: Address, canary: Address, stable: Address, canary_bps: u32) {
         admin.require_auth();
+        // #763: `admin.require_auth()` alone accepts *any* address. Without this
+        // identity check against the stored admin, any account can reach this
+        // entry point by naming itself as `admin`.
+        Self::ensure_admin(&env, &admin);
         shared::rollout::set_canary_deployment(&env, canary, stable, canary_bps);
     }
     pub fn route_to_canary(env: Env, caller: Address) -> bool {
@@ -319,6 +371,10 @@ impl DonationContract {
     }
     pub fn set_rollback_trigger(env: Env, admin: Address, error_bps: u32) {
         admin.require_auth();
+        // #763: `admin.require_auth()` alone accepts *any* address. Without this
+        // identity check against the stored admin, any account can reach this
+        // entry point by naming itself as `admin`.
+        Self::ensure_admin(&env, &admin);
         shared::rollout::set_rollback_trigger(&env, error_bps);
     }
     pub fn should_rollback(env: Env) -> bool {
@@ -326,6 +382,10 @@ impl DonationContract {
     }
     pub fn trigger_rollback(env: Env, admin: Address) {
         admin.require_auth();
+        // #763: `admin.require_auth()` alone accepts *any* address. Without this
+        // identity check against the stored admin, any account can reach this
+        // entry point by naming itself as `admin`.
+        Self::ensure_admin(&env, &admin);
         shared::rollout::trigger_rollback(&env, &admin);
     }
 }
