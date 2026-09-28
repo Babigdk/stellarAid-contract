@@ -7,6 +7,9 @@ use shared::pause;
 use shared::types::{Campaign, CampaignStatus};
 use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env, String, Symbol};
 
+pub mod events;
+pub use events::*;
+
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
@@ -17,6 +20,37 @@ pub enum DataKey {
     Frozen,
     UnderReview,
     ReviewReason,
+    /// Pending (requested but not yet finalized) withdrawal for a campaign (#757).
+    PendingWithdrawal(u64),
+    /// Total amount already finalized out of a campaign (#757).
+    TotalWithdrawn(u64),
+    /// `true` while a dispute is open on a campaign (#758).
+    ActiveDispute(u64),
+    /// 32-byte hash of the open dispute's reason (#758).
+    DisputeReason(u64),
+    /// Whether the open dispute resolved as allowed (`true`) or blocked (`false`) (#758).
+    DisputeOutcome(u64),
+    /// Ledger at which a withdrawal may be finalized.
+    WithdrawalDelayLedgers(u32),
+    /// Total already refunded to a `(campaign, donor)` pair.
+    Refunded(u64, Address),
+    /// `true` once `actor` has donated to `campaign_id`. Drives the
+    /// "donor or creator" authorization rule for disputes (#763).
+    CampaignDonor(u64, Address),
+}
+
+/// A withdrawal that has been requested but not yet finalized.
+///
+/// `available_at` is the ledger at which the funds may be drawn; it is
+/// `requested_at + withdrawal_delay_ledgers`. Emitted verbatim by
+/// `withdrawal_requested` so an indexer never has to recompute it (#757).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingWithdrawal {
+    pub campaign_id: u64,
+    pub amount: i128,
+    pub requested_at: u32,
+    pub available_at: u32,
 }
 
 #[contracttype]
@@ -78,6 +112,13 @@ const MAX_DEADLINE_OFFSET_SECS: u64 = 63_115_200;
 /// Maximum byte length for a campaign-related string input (closes #591).
 const MAX_STRING_INPUT_LEN: u32 = 512;
 
+/// Default delay, in ledgers, between `request_withdrawal` and the earliest
+/// ledger at which `finalize_withdrawal` may run (#757). ~1 day at 5s ledgers.
+const DEFAULT_WITHDRAWAL_DELAY_LEDGERS: u32 = 17_280;
+
+/// Denominator for basis-point math.
+const BPS_DENOM: i128 = 10_000;
+
 #[contract]
 pub struct CampaignContract;
 
@@ -95,7 +136,22 @@ impl CampaignContract {
         env.storage()
             .instance()
             .set(&DataKey::CampaignCount, &0_u64);
+        env.storage()
+            .instance()
+            .set(&DataKey::WithdrawalDelayLedgers, &DEFAULT_WITHDRAWAL_DELAY_LEDGERS);
         shared::version::seed(&env, env!("CARGO_PKG_VERSION"));
+        // `campaign_initialized` is published last so that a subscriber which
+        // keys off it can assume Admin/Initialized/CampaignCount are readable
+        // by the time it observes the event (#755).
+        events::publish(
+            &env,
+            "campaign_initialized",
+            CampaignInitializedEvent {
+                admin,
+                version: String::from_str(&env, env!("CARGO_PKG_VERSION")),
+                timestamp: env.ledger().timestamp(),
+            },
+        );
     }
 
     pub fn get_version(env: Env) -> shared::upgrade::ContractVersion {
@@ -337,10 +393,186 @@ impl CampaignContract {
         Self::bump_campaign_ttl(env.clone(), campaign_id);
     }
 
+    /// Record a donation against a campaign and emit `donation_received` (#756).
+    ///
+    /// Called by the donation contract via a cross-contract call *after* the
+    /// donor's token transfer has settled, so the `raised` total and the event
+    /// are always consistent with the on-chain token movement.
+    ///
+    /// `asset_code` is the human-readable code of the asset that was received
+    /// (for example `USDC`); it is bounded by the donation contract before it
+    /// reaches here. Returns the new `raised` total so the caller does not have
+    /// to re-read storage.
+    pub fn record_donation(
+        env: Env,
+        campaign_id: u64,
+        donor: Address,
+        amount: i128,
+        asset_code: String,
+    ) -> i128 {
+        Self::require_not_frozen(&env);
+        pause::require_not_paused(&env);
+        if amount <= 0 {
+            panic!("donation amount must be positive");
+        }
+
+        let mut campaign = Self::get_campaign(env.clone(), campaign_id).expect("campaign not found");
+        let raised_total = campaign
+            .raised
+            .checked_add(amount)
+            .expect("raised total overflow");
+
+        campaign.raised = raised_total;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Campaign(campaign_id), &campaign);
+        env.storage()
+            .persistent()
+            .set(&DataKey::CampaignDonor(campaign_id, donor.clone()), &true);
+        Self::bump_campaign_ttl(env.clone(), campaign_id);
+
+        // Emitted only after the storage write, per #756.
+        events::publish(
+            &env,
+            "donation_received",
+            DonationReceivedEvent {
+                campaign_id,
+                donor,
+                amount,
+                asset_code,
+                raised_total,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+
+        raised_total
+    }
+
+    /// Request a withdrawal of already-raised funds (#757).
+    ///
+    /// Creator-only. Records a `PendingWithdrawal` and emits
+    /// `withdrawal_requested` with `{ amount, requested_at, available_at }`.
+    /// `finalize_withdrawal` is only permitted once `available_at` has been
+    /// reached, which gives donors a notice window before funds move.
+    pub fn request_withdrawal(env: Env, campaign_id: u64, amount: i128) -> PendingWithdrawal {
+        Self::require_not_frozen(&env);
+        pause::require_not_paused(&env);
+
+        let campaign = Self::get_campaign(env.clone(), campaign_id).expect("campaign not found");
+        campaign.owner.require_auth();
+
+        if amount <= 0 {
+            panic!("withdrawal amount must be positive");
+        }
+        if amount > campaign.raised {
+            panic!("insufficient funds: requested exceeds raised amount");
+        }
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::PendingWithdrawal(campaign_id))
+        {
+            panic!("NoPendingWithdrawal: a withdrawal is already pending");
+        }
+
+        let requested_at = env.ledger().sequence();
+        let delay: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::WithdrawalDelayLedgers)
+            .unwrap_or(DEFAULT_WITHDRAWAL_DELAY_LEDGERS);
+        let available_at = requested_at
+            .checked_add(delay)
+            .expect("withdrawal availability arithmetic overflow");
+
+        let pending = PendingWithdrawal {
+            campaign_id,
+            amount,
+            requested_at,
+            available_at,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::PendingWithdrawal(campaign_id), &pending);
+        Self::bump_campaign_ttl(env.clone(), campaign_id);
+
+        events::publish(
+            &env,
+            "withdrawal_requested",
+            WithdrawalRequestedEvent {
+                campaign_id,
+                amount,
+                requested_at,
+                available_at,
+            },
+        );
+
+        pending
+    }
+
+    /// Get the pending withdrawal for a campaign, if one exists.
+    pub fn get_pending_withdrawal(env: Env, campaign_id: u64) -> Option<PendingWithdrawal> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PendingWithdrawal(campaign_id))
+    }
+
+    /// Cancel a pending withdrawal request and emit `withdrawal_cancelled`.
+    /// Creator-only.
+    pub fn cancel_withdrawal_request(env: Env, campaign_id: u64) {
+        Self::require_not_frozen(&env);
+        pause::require_not_paused(&env);
+
+        let campaign = Self::get_campaign(env.clone(), campaign_id).expect("campaign not found");
+        campaign.owner.require_auth();
+
+        let pending: PendingWithdrawal = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingWithdrawal(campaign_id))
+            .expect("NoPendingWithdrawal");
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::PendingWithdrawal(campaign_id));
+
+        events::publish(
+            &env,
+            "withdrawal_cancelled",
+            WithdrawalCancelledEvent {
+                campaign_id,
+                amount: pending.amount,
+                cancelled_at: env.ledger().sequence(),
+            },
+        );
+    }
+
+    /// Set the notice window, in ledgers, between `request_withdrawal` and the
+    /// earliest ledger at which `finalize_withdrawal` may run. Admin-only.
+    pub fn set_withdrawal_delay_ledgers(env: Env, admin: Address, ledgers: u32) {
+        Self::require_not_frozen(&env);
+        admin.require_auth();
+        Self::ensure_admin(&env, &admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::WithdrawalDelayLedgers, &ledgers);
+    }
+
+    /// Get the total amount already finalized out of a campaign.
+    pub fn get_total_withdrawn(env: Env, campaign_id: u64) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::TotalWithdrawn(campaign_id))
+            .unwrap_or(0_i128)
+    }
+
     /// Finalize a withdrawal for a campaign.
     /// Deducts `amount` from `campaign.raised`.
     /// Blocked with panic `UnderReview` if the contract is flagged for fraud review.
     /// Also blocked if the contract is frozen (`ContractFrozen`) or paused.
+    ///
+    /// When a `request_withdrawal` is pending, the notice window must have
+    /// elapsed (`available_at`) and the amount may not exceed the requested one.
     pub fn finalize_withdrawal(env: Env, campaign_id: u64, amount: i128) {
         Self::require_not_frozen(&env);
         Self::require_not_under_review(&env);
@@ -357,15 +589,318 @@ impl CampaignContract {
             panic!("insufficient funds: requested exceeds raised amount");
         }
 
-        campaign.raised -= amount;
+        if let Some(pending) = Self::get_pending_withdrawal(env.clone(), campaign_id) {
+            if env.ledger().sequence() < pending.available_at {
+                panic!("WithdrawalWindowNotElapsed: withdrawal is still pending");
+            }
+            if amount > pending.amount {
+                panic!("amount exceeds the requested withdrawal amount");
+            }
+            env.storage()
+                .persistent()
+                .remove(&DataKey::PendingWithdrawal(campaign_id));
+        }
+
+        campaign.raised = campaign
+            .raised
+            .checked_sub(amount)
+            .expect("raised total underflow");
+
+        let already_withdrawn = Self::get_total_withdrawn(&env, campaign_id);
+        let total_withdrawn = already_withdrawn
+            .checked_add(amount)
+            .expect("withdrawn total overflow");
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Campaign(campaign_id), &campaign);
+        env.storage()
+            .persistent()
+            .set(&DataKey::TotalWithdrawn(campaign_id), &total_withdrawn);
+        Self::bump_campaign_ttl(env.clone(), campaign_id);
+
+        // `recipient` is the creator: they are the only party authorized to
+        // finalize, and funds may only ever be drawn to the campaign owner.
+        // `fee` is the platform's entitlement on the drawn amount.
+        let fee = amount
+            .checked_mul(campaign.fee_bps as i128)
+            .expect("platform fee arithmetic overflow")
+            / BPS_DENOM;
+
+        // `withdrawal_finalized` is a separate event from
+        // `withdrawal_requested` (#757) and is emitted only after the debits
+        // above have been persisted.
+        events::publish(
+            &env,
+            "withdrawal_finalized",
+            WithdrawalFinalizedEvent {
+                campaign_id,
+                amount,
+                fee,
+                recipient: campaign.owner,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+    }
+
+    /// Record a refund to a donor and emit `refund_issued`.
+    ///
+    /// Donor-authorized (or admin on the donor's behalf via their signature).
+    /// Only accepted while the campaign is not active, so refunds cannot race
+    /// a live donation.
+    pub fn request_refund(env: Env, campaign_id: u64, donor: Address, amount: i128) {
+        Self::require_not_frozen(&env);
+        pause::require_not_paused(&env);
+        donor.require_auth();
+
+        if amount <= 0 {
+            panic!("refund amount must be positive");
+        }
+
+        let campaign = Self::get_campaign(env.clone(), campaign_id).expect("campaign not found");
+        if campaign.status == CampaignStatus::Active {
+            panic!("campaign is not active");
+        }
+
+        let key = DataKey::Refunded(campaign_id, donor.clone());
+        let already: i128 = env.storage().persistent().get(&key).unwrap_or(0_i128);
+        let total = already
+            .checked_add(amount)
+            .expect("refunded total overflow");
+        if total > campaign.raised {
+            panic!("refund amount exceeds the campaign raised total");
+        }
+
+        env.storage().persistent().set(&key, &total);
+        Self::bump_campaign_ttl(env.clone(), campaign_id);
+
+        events::publish(
+            &env,
+            "refund_issued",
+            RefundIssuedEvent {
+                campaign_id,
+                donor,
+                amount,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+    }
+
+    /// Get the total already refunded to a `(campaign, donor)` pair.
+    pub fn get_refunded(env: Env, campaign_id: u64, donor: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Refunded(campaign_id, donor))
+            .unwrap_or(0_i128)
+    }
+
+    /// Raise a dispute against a campaign and emit `dispute_raised` (#758).
+    ///
+    /// Authorized to the campaign owner (creator) or to a donor of the
+    /// campaign. `reason_hash` is a 32-byte hash so that free-form text is
+    /// never written to persistent storage.
+    pub fn raise_dispute(env: Env, campaign_id: u64, raised_by: Address, reason_hash: BytesN<32>) {
+        Self::require_not_frozen(&env);
+        pause::require_not_paused(&env);
+
+        let campaign = Self::get_campaign(env.clone(), campaign_id).expect("campaign not found");
+        if env
+            .storage()
+            .persistent()
+            .get::<DataKey, bool>(&DataKey::ActiveDispute(campaign_id))
+            .unwrap_or(false)
+        {
+            panic!("DisputeAlreadyOpen: a dispute is already open for this campaign");
+        }
+        if reason_hash == BytesN::from_array(&env, &[0u8; 32]) {
+            panic!("reason_hash must not be the zero hash");
+        }
+
+        raised_by.require_auth();
+        Self::require_campaign_party(&env, &campaign, &raised_by);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::ActiveDispute(campaign_id), &true);
+        env.storage()
+            .persistent()
+            .set(&DataKey::DisputeReason(campaign_id), &reason_hash);
+        Self::bump_campaign_ttl(env.clone(), campaign_id);
+
+        events::publish(
+            &env,
+            "dispute_raised",
+            DisputeRaisedEvent {
+                campaign_id,
+                raised_by,
+                reason_hash,
+                raised_at: env.ledger().timestamp(),
+            },
+        );
+    }
+
+    /// Resolve the open dispute on a campaign and emit `dispute_resolved` (#758).
+    ///
+    /// Admin-only. `outcome` is `true` when the disputed withdrawal is allowed
+    /// and `false` when it is blocked.
+    pub fn resolve_dispute(env: Env, admin: Address, campaign_id: u64, outcome: bool) {
+        Self::require_not_frozen(&env);
+        pause::require_not_paused(&env);
+        admin.require_auth();
+        Self::ensure_admin(&env, &admin);
+
+        if !env
+            .storage()
+            .persistent()
+            .get::<DataKey, bool>(&DataKey::ActiveDispute(campaign_id))
+            .unwrap_or(false)
+        {
+            panic!("NoActiveDispute: no open dispute for this campaign");
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::ActiveDispute(campaign_id), &false);
+        env.storage()
+            .persistent()
+            .set(&DataKey::DisputeOutcome(campaign_id), &outcome);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::DisputeReason(campaign_id));
+        Self::bump_campaign_ttl(env.clone(), campaign_id);
+
+        events::publish(
+            &env,
+            "dispute_resolved",
+            DisputeResolvedEvent {
+                campaign_id,
+                outcome,
+                resolved_at: env.ledger().timestamp(),
+            },
+        );
+    }
+
+    /// Query whether a campaign has an open dispute.
+    pub fn has_active_dispute(env: Env, campaign_id: u64) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ActiveDispute(campaign_id))
+            .unwrap_or(false)
+    }
+
+    /// Get the 32-byte reason hash of a campaign's open dispute, if any.
+    pub fn get_dispute_reason(env: Env, campaign_id: u64) -> Option<BytesN<32>> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::DisputeReason(campaign_id))
+    }
+
+    /// Move a campaign to `Completed` and emit `campaign_ended`.
+    /// Creator- or admin-authorized.
+    pub fn end_campaign(env: Env, campaign_id: u64, actor: Address) {
+        Self::require_not_frozen(&env);
+        pause::require_not_paused(&env);
+
+        let mut campaign = Self::get_campaign(env.clone(), campaign_id).expect("campaign not found");
+        Self::require_creator_or_admin(&env, &campaign, &actor);
+        if campaign.status == CampaignStatus::Completed
+            || campaign.status == CampaignStatus::Cancelled
+        {
+            panic!("campaign is already closed");
+        }
+
+        campaign.status = CampaignStatus::Completed;
         env.storage()
             .persistent()
             .set(&DataKey::Campaign(campaign_id), &campaign);
         Self::bump_campaign_ttl(env.clone(), campaign_id);
 
-        env.events().publish(
-            (Symbol::new(&env, "withdrawal_finalized"),),
-            (campaign_id, amount),
+        events::publish(
+            &env,
+            "campaign_ended",
+            CampaignEndedEvent {
+                campaign_id,
+                raised: campaign.raised,
+                goal: campaign.goal,
+                ended_at: env.ledger().timestamp(),
+            },
+        );
+    }
+
+    /// Move a campaign to `Cancelled` and emit `campaign_cancelled`.
+    /// Creator- or admin-authorized. Refused while funds are still raised, so
+    /// a cancellation cannot strand donor funds.
+    pub fn cancel_campaign(env: Env, campaign_id: u64, actor: Address, reason_hash: BytesN<32>) {
+        Self::require_not_frozen(&env);
+        pause::require_not_paused(&env);
+
+        let mut campaign = Self::get_campaign(env.clone(), campaign_id).expect("campaign not found");
+        Self::require_creator_or_admin(&env, &campaign, &actor);
+        if campaign.raised > 0 {
+            panic!("CannotCancelWithFunds: campaign still holds raised funds");
+        }
+        if campaign.status == CampaignStatus::Cancelled {
+            panic!("campaign is already cancelled");
+        }
+
+        campaign.status = CampaignStatus::Cancelled;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Campaign(campaign_id), &campaign);
+        Self::bump_campaign_ttl(env.clone(), campaign_id);
+
+        events::publish(
+            &env,
+            "campaign_cancelled",
+            CampaignCancelledEvent {
+                campaign_id,
+                cancelled_by: actor,
+                reason_hash,
+                cancelled_at: env.ledger().timestamp(),
+            },
+        );
+    }
+
+    /// Push a campaign's deadline out and emit `deadline_extended`.
+    /// Creator-only. The same 2-year ceiling as `create_campaign` applies.
+    pub fn extend_deadline(env: Env, campaign_id: u64, new_deadline: u64) {
+        Self::require_not_frozen(&env);
+        pause::require_not_paused(&env);
+
+        let mut campaign = Self::get_campaign(env.clone(), campaign_id).expect("campaign not found");
+        campaign.owner.require_auth();
+
+        if campaign.status != CampaignStatus::Active {
+            panic!("CampaignNotActive: only an active campaign can be extended");
+        }
+        if new_deadline <= campaign.deadline {
+            panic!("new deadline must be later than the current deadline");
+        }
+
+        let now = env.ledger().timestamp();
+        let max_deadline = now
+            .checked_add(MAX_DEADLINE_OFFSET_SECS)
+            .expect("deadline arithmetic overflow");
+        if new_deadline > max_deadline {
+            panic!("deadline exceeds maximum allowed (2 years from now)");
+        }
+
+        let old_deadline = campaign.deadline;
+        campaign.deadline = new_deadline;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Campaign(campaign_id), &campaign);
+        Self::bump_campaign_ttl(env.clone(), campaign_id);
+
+        events::publish(
+            &env,
+            "deadline_extended",
+            DeadlineExtendedEvent {
+                campaign_id,
+                old_deadline,
+                new_deadline,
+                extended_at: env.ledger().timestamp(),
+            },
         );
     }
 
@@ -538,6 +1073,44 @@ impl CampaignContract {
         }
     }
 
+    /// Assert that `actor` is a party to `campaign` — its owner (the creator)
+    /// or an address that has been recorded as a donor. Used by the dispute
+    /// entry points, which #763's authorization matrix scopes to
+    /// "donor or creator".
+    fn require_campaign_party(env: &Env, campaign: &Campaign, actor: &Address) {
+        if *actor == campaign.owner {
+            return;
+        }
+        if Self::has_donated(env, campaign.id, actor) {
+            return;
+        }
+        panic!("unauthorized: not the campaign creator or a donor of this campaign");
+    }
+
+    /// Assert that `actor` is the campaign owner or the contract admin. Used by
+    /// the lifecycle closers (`end_campaign` / `cancel_campaign`), which an
+    /// admin must be able to drive when a creator is unresponsive.
+    fn require_creator_or_admin(env: &Env, campaign: &Campaign, actor: &Address) {
+        if *actor == campaign.owner {
+            return;
+        }
+        let stored_admin: Option<Address> = env.storage().instance().get(&DataKey::Admin);
+        if stored_admin.as_ref() == Some(actor) {
+            return;
+        }
+        panic!("unauthorized: not the campaign creator or the contract admin");
+    }
+
+    /// Whether `actor` has ever donated to `campaign_id`. The marker is written
+    /// by `record_donation`, which the donation contract calls after a settled
+    /// token transfer, so it is only ever set for a real donation.
+    fn has_donated(env: &Env, campaign_id: u64, actor: &Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CampaignDonor(campaign_id, actor.clone()))
+            .unwrap_or(false)
+    }
+
     fn next_campaign_id(env: &Env) -> u64 {
         let mut next_id: u64 = env
             .storage()
@@ -629,6 +1202,8 @@ impl CampaignContract {
 
 #[cfg(test)]
 mod invariant_tests;
+#[cfg(test)]
+mod event_tests;
 #[cfg(test)]
 mod test {
     use super::*;
