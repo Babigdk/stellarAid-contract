@@ -8,6 +8,16 @@ use shared::pause;
 #[contractclient(name = "CampaignContractClient")]
 trait CampaignContractTrait {
     fn update_raised(env: Env, campaign_id: u64, amount: i128);
+    /// Canonical donation entry point: debits `raised` and emits
+    /// `donation_received` (#756). Preferred over `update_raised` because the
+    /// event carries the donor, the asset code and the new running total.
+    fn record_donation(
+        env: Env,
+        campaign_id: u64,
+        donor: Address,
+        amount: i128,
+        asset_code: String,
+    ) -> i128;
     fn get_campaign(env: Env, campaign_id: u64) -> Option<Campaign>;
 }
 
@@ -61,12 +71,19 @@ impl DonationContract {
         pause::unpause(&env, &admin);
     }
 
+    /// Record a donation and forward it to the campaign contract.
+    ///
+    /// `asset_code` is the human-readable code of the received asset (for
+    /// example `USDC`). It is forwarded verbatim into the campaign contract's
+    /// `donation_received` event (#756) and must already have been bounded by
+    /// the caller; the campaign contract validates the length it depends on.
     pub fn donate(
         env: Env,
         donor: Address,
         campaign_id: u64,
         amount: i128,
         token: Address,
+        asset_code: String,
         anonymous: bool,
         memo: Option<String>,
     ) {
@@ -135,6 +152,15 @@ impl DonationContract {
 
         campaign_client.update_raised(&campaign_id, &amount);
         guard::release(&env);
+        // `record_donation` updates the campaign's `raised` total and emits
+        // `donation_received` from the campaign contract, so the event and the
+        // stored total can never drift apart (#756).
+        campaign_client.record_donation(
+            &campaign_id,
+            &effective_donor,
+            &amount,
+            &asset_code,
+        );
 
         if anonymous {
             env.events().publish(
@@ -163,6 +189,7 @@ impl DonationContract {
         campaign_id: u64,
         amount: i128,
         token: Address,
+        asset_code: String,
         anonymous: bool,
         memo: Option<String>,
         nonce: u64,
@@ -171,7 +198,7 @@ impl DonationContract {
             panic!("nonce already used");
         }
         env.storage().instance().set(&DataKey::Nonce(donor.clone(), nonce), &true);
-        Self::donate(env, donor, campaign_id, amount, token, anonymous, memo);
+        Self::donate(env, donor, campaign_id, amount, token, asset_code, anonymous, memo);
     }
 
     pub fn refund(env: Env, caller: Address, campaign_id: u64, donor: Address, amount: i128, token: Address) {
@@ -309,6 +336,10 @@ mod test {
     use super::*;
     use soroban_sdk::{testutils::Address as _, Env};
 
+    fn asset_code(env: &Env) -> String {
+        String::from_str(env, "USDC")
+    }
+
     #[test]
     fn donation_flow_records_history_and_total() {
         let env = Env::default();
@@ -320,7 +351,7 @@ mod test {
         let campaign_contract = Address::generate(&env);
 
         client.initialize(&admin, &campaign_contract);
-        client.donate(&donor, &7_u64, &100_i128, &None, &false, &None);
+        client.donate(&donor, &7_u64, &100_i128, &None, &asset_code(&env), &false, &None);
 
         let donations = client.get_donations_for_campaign(&7_u64);
         assert_eq!(donations.len(), 1);
@@ -341,12 +372,12 @@ mod test {
         client.pause(&admin);
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            client.donate(&donor, &7_u64, &100_i128, &None, &false, &None);
+            client.donate(&donor, &7_u64, &100_i128, &None, &asset_code(&env), &false, &None);
         }));
         assert!(result.is_err());
 
         client.unpause(&admin);
-        client.donate(&donor, &7_u64, &100_i128, &None, &false, &None);
+        client.donate(&donor, &7_u64, &100_i128, &None, &asset_code(&env), &false, &None);
         assert_eq!(client.get_total_raised(&7_u64), 100_i128);
     }
 
@@ -361,7 +392,7 @@ mod test {
         let campaign_contract = Address::generate(&env);
 
         client.initialize(&admin, &campaign_contract);
-        client.donate(&donor, &7_u64, &100_i128, &None, &true, &None);
+        client.donate(&donor, &7_u64, &100_i128, &None, &asset_code(&env), &true, &None);
 
         let history = client.get_donor_history(&donor);
         assert_eq!(history.len(), 0);
@@ -399,7 +430,7 @@ mod test {
         let token = Address::generate(&env);
 
         client.initialize(&admin, &campaign_contract);
-        client.donate(&donor, &7_u64, &100_i128, &Some(token), &false, &None);
+        client.donate(&donor, &7_u64, &100_i128, &Some(token), &asset_code(&env), &false, &None);
 
         let donations = client.get_donations_for_campaign(&7_u64);
         assert_eq!(donations.len(), 1);
@@ -418,7 +449,7 @@ mod test {
         let memo = String::from_str(&env, "Happy Birthday!");
 
         client.initialize(&admin, &campaign_contract);
-        client.donate(&donor, &7_u64, &100_i128, &None, &false, &Some(memo.clone()));
+        client.donate(&donor, &7_u64, &100_i128, &None, &asset_code(&env), &false, &Some(memo.clone()));
 
         let donations = client.get_donations_for_campaign(&7_u64);
         assert_eq!(donations.get(0).unwrap().memo, Some(memo));
@@ -436,7 +467,7 @@ mod test {
 
         client.initialize(&admin, &campaign_contract);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            client.donate_with_nonce(&donor, &7_u64, &100_i128, &None, &false, &None, &42_u64);
+            client.donate_with_nonce(&donor, &7_u64, &100_i128, &None, &asset_code(&env), &false, &None, &42_u64);
         }));
         // First call may panic because campaign contract is a mock — the nonce guard still fires on duplicate
         // This test validates the nonce tracking exists, not the full flow

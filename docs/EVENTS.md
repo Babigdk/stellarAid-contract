@@ -263,11 +263,18 @@ Emitted by `contracts/platform_config`.
 
 ### 5. Campaign Contract
 
-Emitted by `contracts/campaign`.
+Emitted by `contracts/campaign`. See
+[Campaign Event Schema Reference](#campaign-event-schema-reference) for the
+normative catalogue of topics, data fields and emission points; the list below
+is the legacy short form.
 
 * `campaign_registered`: `(campaign_id: u64, owner: Address, goal: i128, deadline: u64)`
 * `campaign_status_changed`: `(campaign_id: u64, old_status: CampaignStatus, new_status: CampaignStatus)`
 * `campaign_archived`: `(campaign_id: u64)`
+* `contract_frozen` / `contract_unfrozen`: `(admin: Address)`
+* `flag_for_review`: `(admin: Address, reason_hash: BytesN<32>)`
+* `clear_review_flag`: `(admin: Address)`
+* `admin_changed`: `(old_admin: Address, new_admin: Address)`
 
 ---
 
@@ -275,9 +282,14 @@ Emitted by `contracts/campaign`.
 
 Emitted by `contracts/donation`.
 
-* `donation_made`: `(donor: Address, campaign_id: u64, amount: i128, timestamp: u64)`
-* `refund_recorded`: `(campaign_id: u64, donor: Address, amount: i128, caller: Address)`
+* `donation_made`: `(donor: Address, campaign_id: u64, amount: i128)`
+* `donation_refunded`: `(campaign_id: u64, donor: Address, amount: i128, caller: Address)`
 * `anonymous_donation`: `(campaign_id: u64, amount: i128)`
+
+The campaign-side `donation_received` event is emitted by
+`contracts/campaign::record_donation`, which this contract calls after the
+donor's token transfer has settled. See
+[`donation_received`](#donation_received).
 
 ---
 
@@ -288,6 +300,247 @@ Emitted by `contracts/withdrawal`.
 * `withdrawal_requested`: `(withdrawal_id: u64, campaign_id: u64, recipient: Address, amount: i128)`
 * `withdrawal_approved`: `(withdrawal_id: u64, tx_hash: BytesN<32>)`
 * `withdrawal_rejected`: `(withdrawal_id: u64, reason: String)`
+
+The campaign-side withdrawal lifecycle (`withdrawal_requested`,
+`withdrawal_finalized`, `withdrawal_cancelled`) is emitted by
+`contracts/campaign` — see
+[Campaign Event Schema Reference](#campaign-event-schema-reference).
+
+---
+
+## Campaign Event Schema Reference
+
+This section is the normative reference for campaign-side events and fulfils
+the "define all contract event schemas" requirement: every event below states
+its **topics**, its **data fields**, and **when it is emitted**.
+
+### Naming convention
+
+Every campaign-side event uses:
+
+```text
+<entity>_<past_tense_verb>        // snake_case, e.g. withdrawal_finalized
+```
+
+* `<entity>` is one of `campaign`, `donation`, `withdrawal`, `dispute`, `refund`.
+* The verb is always past tense and always the **last** segment, so an indexer
+  can group a single entity's lifecycle by a stable prefix.
+
+The convention carries through to the `#[contracttype]` payload structs in
+`contracts/campaign/src/events.rs`: the struct name is the event name in
+`PascalCase` with an `Event` suffix (`withdrawal_finalized` →
+`WithdrawalFinalizedEvent`).
+
+### Topic layout
+
+```text
+topics: ( Symbol("<event_name>"), Address /* emitting contract */ )
+data:   <EventStruct>   // #[contracttype]; the field order below is the wire order
+```
+
+* **Topic 0** is the event name, so a Horizon/RPC `getEvents` filter can select
+  a single event by symbol alone.
+* **Topic 1** is the emitting contract address, so a relayed event (the donation
+  contract forwarding into the campaign contract) stays attributable.
+
+Both segments are mandatory. A single-event RPC filter looks like:
+
+```json
+{
+  "type": "contract",
+  "contractId": "<CAMPAIGN_CONTRACT_ID>",
+  "topics": [["donation_received", "A"]]
+}
+```
+
+`"A"` is the any-value wildcard. Do **not** assume a three-topic shape for these
+events: token `transfer` events also carry three topics, which is precisely why
+the campaign schema is pinned at two.
+
+### Catalogue
+
+#### `campaign_initialized`
+* **Topics:** `["campaign_initialized", contract_address]`
+* **Emitted by:** `initialize`, after `Admin` / `Initialized` / `CampaignCount`
+  have been written. Once per deployment.
+* **Data:**
+
+| Field | Type | Description |
+|---|---|---|
+| `admin` | `Address` | Admin stored at initialization; the only address that can `upgrade` |
+| `version` | `String` | Crate semver seeded into the version store |
+| `timestamp` | `u64` | Ledger timestamp of initialization |
+
+#### `campaign_registered`
+* **Topics:** `["campaign_registered", contract_address]` *(currently single-topic on chain; see note below)*
+* **Emitted by:** `create_campaign`, after the `Campaign` record is persisted and
+  its TTL extended.
+* **Data:** `(campaign_id: u64, owner: Address, goal: i128, deadline: u64)`
+
+#### `donation_received`
+* **Topics:** `["donation_received", contract_address]`
+* **Emitted by:** `record_donation`, **after** a successful token transfer *and*
+  after the campaign's `raised` total has been updated in storage. The donation
+  contract calls it cross-contract, so the amount always matches an on-chain
+  token movement.
+* **Data:**
+
+| Field | Type | Description |
+|---|---|---|
+| `campaign_id` | `u64` | Campaign credited (carried in the data, not as a third topic) |
+| `donor` | `Address` | Donor address; an ephemeral address for anonymous donations |
+| `amount` | `i128` | Amount received, in the asset's base unit |
+| `asset_code` | `String` | Human-readable asset code, at most 12 characters (e.g. `USDC`) |
+| `raised_total` | `i128` | Campaign `raised` **after** this donation — a running total, not a delta |
+| `timestamp` | `u64` | Ledger timestamp of the donation |
+
+#### `withdrawal_requested`
+* **Topics:** `["withdrawal_requested", contract_address]`
+* **Emitted by:** `request_withdrawal`, after the `PendingWithdrawal` record is
+  written. Creator-only. This event only *schedules* funds; it never implies a
+  transfer.
+* **Data:**
+
+| Field | Type | Description |
+|---|---|---|
+| `campaign_id` | `u64` | Campaign the request belongs to |
+| `amount` | `i128` | Amount requested, in the campaign's base unit |
+| `requested_at` | `u32` | Ledger sequence at which the request was made |
+| `available_at` | `u32` | Earliest ledger sequence at which `finalize_withdrawal` may run (`requested_at + withdrawal_delay_ledgers`) |
+
+#### `withdrawal_finalized`
+* **Topics:** `["withdrawal_finalized", contract_address]`
+* **Emitted by:** `finalize_withdrawal`, after `raised` has been debited and the
+  running `TotalWithdrawn` updated. Emitted **separately** from
+  `withdrawal_requested`; consumers must treat the pair as a state machine
+  rather than a single notification. Suppressed while the contract is frozen,
+  paused, or under fraud review.
+* **Data:**
+
+| Field | Type | Description |
+|---|---|---|
+| `campaign_id` | `u64` | Campaign the funds were drawn from |
+| `amount` | `i128` | Gross amount deducted from `raised` |
+| `fee` | `i128` | Platform fee entitlement on `amount` (`amount * fee_bps / 10_000`) |
+| `recipient` | `Address` | Campaign owner; funds may only ever be drawn to the creator |
+| `timestamp` | `u64` | Ledger timestamp of finalization |
+
+#### `withdrawal_cancelled`
+* **Topics:** `["withdrawal_cancelled", contract_address]`
+* **Emitted by:** `cancel_withdrawal_request`, after the pending request has been
+  removed from storage. Creator-only.
+* **Data:**
+
+| Field | Type | Description |
+|---|---|---|
+| `campaign_id` | `u64` | Campaign whose request was cancelled |
+| `amount` | `i128` | Amount of the cancelled request |
+| `cancelled_at` | `u32` | Ledger sequence at which it was cancelled |
+
+#### `dispute_raised`
+* **Topics:** `["dispute_raised", contract_address]`
+* **Emitted by:** `raise_dispute`, after the open-dispute marker and the reason
+  hash are written. Authorized to the campaign creator or to a donor of that
+  campaign. Refused with `DisputeAlreadyOpen` when one is already open.
+* **Data:**
+
+| Field | Type | Description |
+|---|---|---|
+| `campaign_id` | `u64` | Disputed campaign |
+| `raised_by` | `Address` | Creator or donor that raised the dispute |
+| `reason_hash` | `BytesN<32>` | SHA-256 of the reason text; the text itself is never stored on chain |
+| `raised_at` | `u64` | Ledger timestamp of the dispute |
+
+#### `dispute_resolved`
+* **Topics:** `["dispute_resolved", contract_address]`
+* **Emitted by:** `resolve_dispute`. Admin-only. Refused with `NoActiveDispute`
+  when no dispute is open.
+* **Data:**
+
+| Field | Type | Description |
+|---|---|---|
+| `campaign_id` | `u64` | Disputed campaign |
+| `outcome` | `bool` | `true` = the disputed withdrawal is **allowed**; `false` = **blocked** |
+| `resolved_at` | `u64` | Ledger timestamp of resolution |
+
+#### `refund_issued`
+* **Topics:** `["refund_issued", contract_address]`
+* **Emitted by:** `request_refund`, after the donor's running refund total has
+  been updated. Only accepted once the campaign is no longer `Active`.
+* **Data:**
+
+| Field | Type | Description |
+|---|---|---|
+| `campaign_id` | `u64` | Campaign refunded from |
+| `donor` | `Address` | Donor entitled to the refund |
+| `amount` | `i128` | Amount credited to the donor in this call |
+| `timestamp` | `u64` | Ledger timestamp |
+
+#### `campaign_ended`
+* **Topics:** `["campaign_ended", contract_address]`
+* **Emitted by:** `end_campaign`, after the status becomes `Completed`.
+  Creator- or admin-authorized.
+* **Data:**
+
+| Field | Type | Description |
+|---|---|---|
+| `campaign_id` | `u64` | Campaign that ended |
+| `raised` | `i128` | Total raised at close |
+| `goal` | `i128` | Original goal |
+| `ended_at` | `u64` | Ledger timestamp of the transition |
+
+#### `campaign_cancelled`
+* **Topics:** `["campaign_cancelled", contract_address]`
+* **Emitted by:** `cancel_campaign`, after the status becomes `Cancelled`.
+  Creator- or admin-authorized. Refused with `CannotCancelWithFunds` while
+  `raised > 0`, so a cancellation can never strand donor funds.
+* **Data:**
+
+| Field | Type | Description |
+|---|---|---|
+| `campaign_id` | `u64` | Campaign that was cancelled |
+| `cancelled_by` | `Address` | Creator or admin that cancelled it |
+| `reason_hash` | `BytesN<32>` | SHA-256 of the cancellation reason |
+| `cancelled_at` | `u64` | Ledger timestamp of the transition |
+
+#### `deadline_extended`
+* **Topics:** `["deadline_extended", contract_address]`
+* **Emitted by:** `extend_deadline`, after the new deadline is persisted.
+  Creator-only. The new deadline must be later than the current one, the
+  campaign must be `Active`, and the 2-year ceiling from `create_campaign` still
+  applies. Carrying both the old and the new value means a reminder job never
+  has to diff two reads.
+* **Data:**
+
+| Field | Type | Description |
+|---|---|---|
+| `campaign_id` | `u64` | Campaign whose deadline moved |
+| `old_deadline` | `u64` | Previous deadline (ledger timestamp) |
+| `new_deadline` | `u64` | New deadline (ledger timestamp) |
+| `extended_at` | `u64` | Ledger timestamp of the extension |
+
+### Emission matrix
+
+| Event | Emitting function | Pre-condition | Post-condition | Authorization |
+|---|---|---|---|---|
+| `campaign_initialized` | `initialize` | not yet initialized | `Admin`, `Initialized`, `CampaignCount` set | `admin.require_auth()` |
+| `campaign_registered` | `create_campaign` | deadline in (now, now + 2y]; `fee_bps <= 1000` | `Campaign(id)` persisted, TTL extended | `owner.require_auth()` |
+| `donation_received` | `record_donation` | `amount > 0`; campaign exists | `raised += amount`; donor marker set | called by the donation contract after the transfer settles |
+| `withdrawal_requested` | `request_withdrawal` | `0 < amount <= raised`; no pending request | `PendingWithdrawal(id)` persisted | creator (`campaign.owner`) |
+| `withdrawal_finalized` | `finalize_withdrawal` | `0 < amount <= raised`; window elapsed; not frozen/paused/under review | `raised -= amount`; `TotalWithdrawn += amount` | creator (`campaign.owner`) |
+| `withdrawal_cancelled` | `cancel_withdrawal_request` | a pending request exists | `PendingWithdrawal(id)` removed | creator |
+| `dispute_raised` | `raise_dispute` | no open dispute; `reason_hash != 0` | `ActiveDispute(id) = true`; reason hash stored | creator **or** donor |
+| `dispute_resolved` | `resolve_dispute` | a dispute is open | `ActiveDispute(id) = false`; outcome stored | admin |
+| `refund_issued` | `request_refund` | campaign is not `Active`; `amount > 0` | `Refunded(id, donor) += amount` | donor |
+| `campaign_ended` | `end_campaign` | campaign not already closed | status = `Completed` | creator **or** admin |
+| `campaign_cancelled` | `cancel_campaign` | `raised == 0`; not already cancelled | status = `Cancelled` | creator **or** admin |
+| `deadline_extended` | `extend_deadline` | `Active`; new deadline later and within 2y | `deadline` updated | creator |
+
+Pre-existing single-topic events in this contract (`campaign_registered`,
+`campaign_status_changed`, `campaign_archived`, `contract_frozen`,
+`contract_unfrozen`, `flag_for_review`, `clear_review_flag`, `admin_changed`)
+keep their historical single-topic shape for backwards compatibility with
+existing indexers. New events must use the two-segment layout above.
 
 ---
 
