@@ -13,6 +13,11 @@ pub enum DisputeError {
     AutoResolveNotDue = 7,
     InvalidShareBps = 8,
     ArithmeticOverflow = 9,
+    /// The resolution note exceeds `shared::validation::MAX_MEMO_LEN` (#765).
+    /// The note is written to persistent storage, so it has to be bounded
+    /// before the write, not after. Appended, never renumbered: error code
+    /// values are permanent per `docs/UPGRADE_AND_ROLLBACK.md`.
+    NoteTooLong = 10,
 }
 
 impl core::fmt::Display for DisputeError {
@@ -27,6 +32,7 @@ impl core::fmt::Display for DisputeError {
             Self::AutoResolveNotDue => write!(f, "auto-resolve not yet due"),
             Self::InvalidShareBps => write!(f, "invalid share bps"),
             Self::ArithmeticOverflow => write!(f, "arithmetic operation would overflow"),
+            Self::NoteTooLong => write!(f, "resolution note exceeds maximum length"),
         }
     }
 }
@@ -42,5 +48,6 @@ pub fn get_suggestion(error: DisputeError) -> Symbol {
         DisputeError::AutoResolveNotDue => symbol_short!("NOT_DUE"),
         DisputeError::InvalidShareBps => symbol_short!("BAD_BPS"),
         DisputeError::ArithmeticOverflow => symbol_short!("OVERFL"),
+        DisputeError::NoteTooLong => symbol_short!("LONG_NOTE"),
     }
 }

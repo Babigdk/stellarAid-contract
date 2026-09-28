@@ -25,6 +25,8 @@ members = [
     "contracts/mentorship",
     "contracts/campaign",
     "contracts/campaign_factory",
+    "contracts/campaign_instance",
+    "contracts/factory",
     "sdk",
     "tests/framework",
     "tests/upgrade_testing",

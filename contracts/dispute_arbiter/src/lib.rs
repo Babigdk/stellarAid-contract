@@ -10,6 +10,7 @@ pub mod errors;
 pub mod types;
 
 use errors::DisputeError;
+use shared::guard;
 use types::{DataKey, DisputeRecord, DisputeStatus};
 
 include!("../../semver_types.rs");
@@ -122,6 +123,10 @@ impl DisputeArbiter {
         commission_id: Bytes,
         initiator: Address,
     ) -> Result<(), DisputeError> {
+        // Guard first (#762): `open_dispute` writes a dispute record that the
+        // resolve paths read, so a re-entrant call must be refused before it
+        // is applied.
+        guard::acquire(&env);
         if !has_admin(&env) {
             return Err(DisputeError::NotInitialized);
         }
@@ -131,7 +136,11 @@ impl DisputeArbiter {
         }
         let current_ledger = env.ledger().sequence();
         let auto_resolve_offset = get_auto_resolve_ledgers(&env)?;
-        let auto_resolve_ledger = current_ledger + auto_resolve_offset;
+        // Checked addition (#760): a wrapped auto-resolve ledger would make a
+        // dispute unresolvable.
+        let auto_resolve_ledger = current_ledger
+            .checked_add(auto_resolve_offset)
+            .ok_or(DisputeError::ArithmeticOverflow)?;
         let record = DisputeRecord {
             commission_id: commission_id.clone(),
             opened_ledger: current_ledger,
@@ -140,6 +149,7 @@ impl DisputeArbiter {
             resolution_note: None,
         };
         save_dispute(&env, &record);
+        guard::release(&env);
         env.events()
             .publish((symbol_short!("opened"),), (commission_id, initiator, current_ledger, auto_resolve_ledger));
         Ok(())
@@ -150,8 +160,16 @@ impl DisputeArbiter {
         commission_id: Bytes,
         note: String,
     ) -> Result<(), DisputeError> {
+        // Guard first (#762): the refund below is an external contract call,
+        // which is exactly the window a re-entrant call would exploit.
+        guard::acquire(&env);
         let admin = get_admin(&env)?;
         admin.require_auth();
+        // #765: the note is written to persistent storage, so bound it before
+        // the escrow refund rather than after it.
+        if note.len() > shared::validation::MAX_MEMO_LEN {
+            return Err(DisputeError::NoteTooLong);
+        }
         let mut record = load_dispute(&env, &commission_id)?;
         if record.status != DisputeStatus::Open {
             return Err(DisputeError::InvalidStatus);
@@ -166,6 +184,7 @@ impl DisputeArbiter {
         record.status = DisputeStatus::ResolvedForClient;
         record.resolution_note = Some(note.clone());
         save_dispute(&env, &record);
+        guard::release(&env);
         env.events()
             .publish((symbol_short!("resolved"),), (commission_id, DisputeStatus::ResolvedForClient, note));
         Ok(())
@@ -176,8 +195,14 @@ impl DisputeArbiter {
         commission_id: Bytes,
         note: String,
     ) -> Result<(), DisputeError> {
+        guard::acquire(&env);
         let admin = get_admin(&env)?;
         admin.require_auth();
+        // #765: the note is written to persistent storage, so bound it before
+        // the escrow release rather than after it.
+        if note.len() > shared::validation::MAX_MEMO_LEN {
+            return Err(DisputeError::NoteTooLong);
+        }
         let mut record = load_dispute(&env, &commission_id)?;
         if record.status != DisputeStatus::Open {
             return Err(DisputeError::InvalidStatus);
@@ -192,6 +217,7 @@ impl DisputeArbiter {
         record.status = DisputeStatus::ResolvedForArtist;
         record.resolution_note = Some(note.clone());
         save_dispute(&env, &record);
+        guard::release(&env);
         env.events()
             .publish((symbol_short!("resolved"),), (commission_id, DisputeStatus::ResolvedForArtist, note));
         Ok(())
@@ -203,10 +229,16 @@ impl DisputeArbiter {
         client_share_bps: u32,
         note: String,
     ) -> Result<(), DisputeError> {
+        guard::acquire(&env);
         let admin = get_admin(&env)?;
         admin.require_auth();
         if client_share_bps > 10000 {
             return Err(DisputeError::InvalidShareBps);
+        }
+        // #765: the note is written to persistent storage, so bound it before
+        // the escrow refund and the transfers rather than after them.
+        if note.len() > shared::validation::MAX_MEMO_LEN {
+            return Err(DisputeError::NoteTooLong);
         }
         let mut record = load_dispute(&env, &commission_id)?;
         if record.status != DisputeStatus::Open {
@@ -236,8 +268,16 @@ impl DisputeArbiter {
             soroban_sdk::vec![&env, escrow_contract.clone().into_val(&env)],
         );
 
-        let client_share = escrow_balance * (client_share_bps as i128) / 10000;
-        let artist_share = escrow_balance * (artist_share_bps as i128) / 10000;
+        // Checked multiplication (#760): an unchecked product here could wrap a
+        // share to a negative amount and drain the escrow on transfer.
+        let client_share = escrow_balance
+            .checked_mul(client_share_bps as i128)
+            .ok_or(DisputeError::ArithmeticOverflow)?
+            / 10000;
+        let artist_share = escrow_balance
+            .checked_mul(artist_share_bps as i128)
+            .ok_or(DisputeError::ArithmeticOverflow)?
+            / 10000;
 
         if client_share > 0 {
             env.invoke_contract::<()>(
@@ -267,6 +307,7 @@ impl DisputeArbiter {
         record.status = DisputeStatus::PartiallyResolved;
         record.resolution_note = Some(note.clone());
         save_dispute(&env, &record);
+        guard::release(&env);
         env.events().publish(
             (symbol_short!("resolved"),),
             (commission_id, DisputeStatus::PartiallyResolved, client_share_bps, note),
