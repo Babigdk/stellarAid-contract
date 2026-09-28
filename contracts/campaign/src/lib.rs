@@ -3,9 +3,15 @@
 #[cfg(test)]
 extern crate std;
 
+use shared::guard;
 use shared::pause;
 use shared::types::{Campaign, CampaignStatus};
 use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env, String, Symbol};
+
+pub mod errors;
+pub mod math;
+pub mod require;
+pub use errors::Error;
 
 #[contracttype]
 #[derive(Clone)]
@@ -78,6 +84,12 @@ const MAX_DEADLINE_OFFSET_SECS: u64 = 63_115_200;
 /// Maximum byte length for a campaign-related string input (closes #591).
 const MAX_STRING_INPUT_LEN: u32 = 512;
 
+/// Smallest donation the campaign contract will credit (closes #759).
+/// One stroop: below this a donation cannot be represented in the accounting
+/// without rounding, and `DonationTooSmall` is a far better answer than a
+/// zero-value ledger entry.
+const MIN_DONATION_AMOUNT: i128 = 1;
+
 #[contract]
 pub struct CampaignContract;
 
@@ -87,9 +99,10 @@ impl CampaignContract {
     /// Must be called once before any other operations.
     pub fn initialize(env: Env, admin: Address) {
         admin.require_auth();
-        if env.storage().instance().has(&DataKey::Initialized) {
-            panic!("already initialized");
-        }
+        crate::require!(env, not_initialized, env
+            .storage()
+            .instance()
+            .has(&DataKey::Initialized));
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Initialized, &true);
         env.storage()
@@ -119,6 +132,8 @@ impl CampaignContract {
     /// Freeze the campaign contract in an emergency, halting all state-changing activities.
     /// Admin-only. Sets DataKey::Frozen and emits `contract_frozen`.
     pub fn freeze(env: Env) {
+        // Guard first: an emergency action must not be re-entrant (#762).
+        guard::acquire(&env);
         let admin: Address = env
             .storage()
             .instance()
@@ -126,6 +141,7 @@ impl CampaignContract {
             .expect("contract not initialized");
         admin.require_auth();
         env.storage().instance().set(&DataKey::Frozen, &true);
+        guard::release(&env);
         env.events().publish(
             (Symbol::new(&env, "contract_frozen"),),
             ContractFrozenEvent {
@@ -137,6 +153,7 @@ impl CampaignContract {
     /// Unfreeze the campaign contract, restoring normal state-changing operations.
     /// Admin-only. Clears DataKey::Frozen and emits `contract_unfrozen`.
     pub fn unfreeze(env: Env) {
+        guard::acquire(&env);
         let admin: Address = env
             .storage()
             .instance()
@@ -144,6 +161,7 @@ impl CampaignContract {
             .expect("contract not initialized");
         admin.require_auth();
         env.storage().instance().set(&DataKey::Frozen, &false);
+        guard::release(&env);
         env.events().publish(
             (Symbol::new(&env, "contract_unfrozen"),),
             ContractUnfrozenEvent {
@@ -164,6 +182,7 @@ impl CampaignContract {
     /// The actual automated AI fraud-scoring system (Phase 4) is out of scope for this
     /// on-chain contract and will call this hook via an authorized off-chain service/oracle.
     pub fn flag_for_review(env: Env, reason_hash: BytesN<32>) {
+        guard::acquire(&env);
         Self::require_not_frozen(&env);
         let admin: Address = env
             .storage()
@@ -177,6 +196,7 @@ impl CampaignContract {
             .instance()
             .set(&DataKey::ReviewReason, &reason_hash);
 
+        guard::release(&env);
         env.events().publish(
             (Symbol::new(&env, "flag_for_review"),),
             CampaignUnderReviewEvent { admin, reason_hash },
@@ -189,6 +209,7 @@ impl CampaignContract {
     /// NOTE: This is a manual admin action. Once investigation concludes or an
     /// off-chain review clears the account, an admin clears this flag.
     pub fn clear_review_flag(env: Env) {
+        guard::acquire(&env);
         Self::require_not_frozen(&env);
         let admin: Address = env
             .storage()
@@ -200,6 +221,7 @@ impl CampaignContract {
         env.storage().instance().set(&DataKey::UnderReview, &false);
         env.storage().instance().remove(&DataKey::ReviewReason);
 
+        guard::release(&env);
         env.events().publish(
             (Symbol::new(&env, "clear_review_flag"),),
             CampaignReviewClearedEvent { admin },
@@ -242,23 +264,20 @@ impl CampaignContract {
         fee_bps: u32,
         platform_wallet: Option<Address>,
     ) -> u64 {
+        // Guard first, before any read a re-entrant call could observe as
+        // half-applied (#762).
+        guard::acquire(&env);
         Self::require_not_frozen(&env);
         pause::require_not_paused(&env);
         owner.require_auth();
         if fee_bps > 1000 {
             panic!("fee_bps must not exceed 1000");
         }
-        // ── Deadline upper bound (closes #592) ─────────────────────────────
+        // ── Typed input validation (closes #759) ──────────────────────────
+        crate::require!(env, valid_goal, goal);
+        // ── Deadline upper bound (closes #592) and typed lower bound (#759) ──
         let now = env.ledger().timestamp();
-        let max_deadline = now
-            .checked_add(MAX_DEADLINE_OFFSET_SECS)
-            .expect("deadline arithmetic overflow");
-        if deadline > max_deadline {
-            panic!("deadline exceeds maximum allowed (2 years from now)");
-        }
-        if deadline <= now {
-            panic!("deadline must be in the future");
-        }
+        crate::require!(env, valid_end_time, now, deadline, MAX_DEADLINE_OFFSET_SECS);
         let id = Self::next_campaign_id(&env);
         let campaign = Campaign {
             id,
@@ -274,6 +293,7 @@ impl CampaignContract {
             .persistent()
             .set(&DataKey::Campaign(id), &campaign);
         Self::bump_campaign_ttl(env.clone(), id);
+        guard::release(&env);
         env.events().publish(
             (Symbol::new(&env, "campaign_registered"),),
             CampaignRegisteredEvent {
@@ -301,6 +321,10 @@ impl CampaignContract {
         campaign_id: u64,
         new_status: CampaignStatus,
     ) {
+        // Guard first (#762). Note: `approve_campaign` / `suspend_campaign`
+        // delegate here, so they are deliberately NOT guarded themselves — the
+        // guard is not re-entrant and would reject the inner call.
+        guard::acquire(&env);
         Self::require_not_frozen(&env);
         admin.require_auth();
         Self::ensure_admin(&env, &admin);
@@ -310,6 +334,7 @@ impl CampaignContract {
         env.storage()
             .persistent()
             .set(&DataKey::Campaign(campaign_id), &campaign);
+        guard::release(&env);
         env.events().publish(
             (Symbol::new(&env, "campaign_status_changed"),),
             CampaignStatusChangedEvent {
@@ -322,19 +347,34 @@ impl CampaignContract {
 
     /// Increment the raised amount for a campaign. Called via cross-contract
     /// call from the Donation contract after a successful donation.
+    ///
+    /// Rejects a closed or non-active campaign (`CampaignEnded` /
+    /// `CampaignNotActive`), a sub-minimum donation (`DonationTooSmall`), and
+    /// a call made before `initialize` (`NotInitialized`).
     pub fn update_raised(env: Env, campaign_id: u64, amount: i128) {
+        // Guard first (#762).
+        guard::acquire(&env);
         Self::require_not_frozen(&env);
         pause::require_not_paused(&env);
+        crate::require!(env, initialized, env
+            .storage()
+            .instance()
+            .has(&DataKey::Initialized));
+        crate::require!(env, donation_minimum, amount, MIN_DONATION_AMOUNT);
         let mut campaign = env
             .storage()
             .persistent()
             .get::<DataKey, Campaign>(&DataKey::Campaign(campaign_id))
             .unwrap();
-        campaign.raised += amount;
+        crate::require!(env, campaign_open, campaign.status);
+        // Checked addition: a silent wrap of `raised` would report a balance
+        // the campaign does not hold (#760).
+        campaign.raised = math::add(&env, campaign.raised, amount);
         env.storage()
             .persistent()
             .set(&DataKey::Campaign(campaign_id), &campaign);
         Self::bump_campaign_ttl(env.clone(), campaign_id);
+        guard::release(&env);
     }
 
     /// Finalize a withdrawal for a campaign.
@@ -342,6 +382,8 @@ impl CampaignContract {
     /// Blocked with panic `UnderReview` if the contract is flagged for fraud review.
     /// Also blocked if the contract is frozen (`ContractFrozen`) or paused.
     pub fn finalize_withdrawal(env: Env, campaign_id: u64, amount: i128) {
+        // Guard first (#762).
+        guard::acquire(&env);
         Self::require_not_frozen(&env);
         Self::require_not_under_review(&env);
         pause::require_not_paused(&env);
@@ -353,19 +395,27 @@ impl CampaignContract {
         if amount <= 0 {
             panic!("withdrawal amount must be positive");
         }
-        if amount > campaign.raised {
-            panic!("insufficient funds: requested exceeds raised amount");
-        }
+        // The campaign's recorded balance must cover the payout, checked
+        // before any state is mutated so a doomed withdrawal can never leave a
+        // half-applied debit (#759 / #764).
+        crate::require!(env, contract_balance, campaign.raised, amount);
 
-        campaign.raised -= amount;
+        // Checked subtraction: an underflow here would mean paying out funds
+        // the campaign never raised (#760).
+        campaign.raised = math::sub(&env, campaign.raised, amount);
         env.storage()
             .persistent()
             .set(&DataKey::Campaign(campaign_id), &campaign);
         Self::bump_campaign_ttl(env.clone(), campaign_id);
 
+        // Platform fee on the drawn amount, computed with checked maths so
+        // `fee + net` is exactly `amount` (#760).
+        let (fee, _net) = math::fee_split(&env, amount, campaign.fee_bps);
+
+        guard::release(&env);
         env.events().publish(
             (Symbol::new(&env, "withdrawal_finalized"),),
-            (campaign_id, amount),
+            (campaign_id, amount, fee, campaign.owner, env.ledger().timestamp()),
         );
     }
 
@@ -378,6 +428,7 @@ impl CampaignContract {
     /// Reject a campaign, moving it to Rejected status.
     /// Closes #591 – validates reason length.
     pub fn reject_campaign(env: Env, admin: Address, campaign_id: u64, reason: String) {
+        guard::acquire(&env);
         Self::require_not_frozen(&env);
         pause::require_not_paused(&env);
         admin.require_auth();
@@ -392,6 +443,7 @@ impl CampaignContract {
         env.storage()
             .persistent()
             .set(&DataKey::Campaign(campaign_id), &campaign);
+        guard::release(&env);
         env.events().publish(
             (Symbol::new(&env, "campaign_status_changed"),),
             CampaignStatusChangedEvent {
@@ -429,6 +481,7 @@ impl CampaignContract {
     /// Current admin authorization and new admin authorization are both required.
     /// Emits `admin_changed` event and maintains exactly one admin in storage.
     pub fn set_admin(env: Env, new_admin: Address) {
+        guard::acquire(&env);
         Self::require_not_frozen(&env);
         pause::require_not_paused(&env);
 
@@ -442,6 +495,7 @@ impl CampaignContract {
         new_admin.require_auth();
 
         env.storage().instance().set(&DataKey::Admin, &new_admin);
+        guard::release(&env);
 
         env.events().publish(
             (Symbol::new(&env, "admin_changed"),),
@@ -454,11 +508,13 @@ impl CampaignContract {
 
     /// Transfer admin privileges to a new address.
     pub fn transfer_admin(env: Env, current_admin: Address, new_admin: Address) {
+        guard::acquire(&env);
         Self::require_not_frozen(&env);
         pause::require_not_paused(&env);
         current_admin.require_auth();
         Self::ensure_admin(&env, &current_admin);
         env.storage().instance().set(&DataKey::Admin, &new_admin);
+        guard::release(&env);
     }
 
     /// Upgrade the contract to a new WASM implementation.
@@ -475,6 +531,7 @@ impl CampaignContract {
     /// Completed, Rejected, Cancelled, or Suspended (i.e., no active funds
     /// in flight).
     pub fn archive_campaign(env: Env, admin: Address, campaign_id: u64) {
+        guard::acquire(&env);
         Self::require_not_frozen(&env);
         admin.require_auth();
         Self::ensure_admin(&env, &admin);
@@ -488,6 +545,7 @@ impl CampaignContract {
         env.storage()
             .persistent()
             .remove(&DataKey::Campaign(campaign_id));
+        guard::release(&env);
         env.events()
             .publish((Symbol::new(&env, "campaign_archived"),), (campaign_id,));
     }
@@ -513,9 +571,7 @@ impl CampaignContract {
     }
 
     fn require_not_frozen(env: &Env) {
-        if Self::check_frozen(env) {
-            panic!("ContractFrozen");
-        }
+        crate::require!(env, not_frozen, Self::check_frozen(env));
     }
 
     fn check_under_review(env: &Env) -> bool {
@@ -533,18 +589,17 @@ impl CampaignContract {
 
     fn ensure_admin(env: &Env, admin: &Address) {
         let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        if stored_admin != *admin {
-            panic!("unauthorized");
-        }
+        crate::require!(env, authorized, stored_admin == *admin);
     }
 
     fn next_campaign_id(env: &Env) -> u64 {
-        let mut next_id: u64 = env
+        let current: u64 = env
             .storage()
             .instance()
             .get(&DataKey::CampaignCount)
             .unwrap_or(0_u64);
-        next_id += 1;
+        // Checked: a wrapped campaign counter would hand out a duplicate id (#760).
+        let next_id: u64 = math::add_u64(env, current, 1);
         env.storage()
             .instance()
             .set(&DataKey::CampaignCount, &next_id);
@@ -629,6 +684,8 @@ impl CampaignContract {
 
 #[cfg(test)]
 mod invariant_tests;
+#[cfg(test)]
+mod negative_tests;
 #[cfg(test)]
 mod test {
     use super::*;

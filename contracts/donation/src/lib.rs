@@ -2,6 +2,7 @@
 
 use soroban_sdk::{contract, contractclient, contractimpl, contracttype, token, Address, BytesN, Env, String, Symbol, Vec};
 use shared::types::{Campaign, CampaignStatus, Donation, DonationRefundedEvent, AnonymousDonationEvent};
+use shared::guard;
 use shared::pause;
 
 #[contractclient(name = "CampaignContractClient")]
@@ -69,6 +70,10 @@ impl DonationContract {
         anonymous: bool,
         memo: Option<String>,
     ) {
+        // Guard first (#762): a donation touches the token contract and then
+        // writes three storage entries, so a re-entrant call must be refused
+        // before any of them is applied.
+        guard::acquire(&env);
         pause::require_not_paused(&env);
         if !anonymous {
             donor.require_auth();
@@ -114,10 +119,22 @@ impl DonationContract {
             env.storage().persistent().set(&DataKey::DonationHistory(donor), &history);
         }
 
-        let total = env.storage().persistent().get(&DataKey::CampaignRaised(campaign_id)).unwrap_or(0_i128);
-        env.storage().persistent().set(&DataKey::CampaignRaised(campaign_id), &(total + amount));
+        // Checked addition (#760): a wrapped running total would report a
+        // balance the contract does not hold.
+        let total = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CampaignRaised(campaign_id))
+            .unwrap_or(0_i128);
+        let new_total = total
+            .checked_add(amount)
+            .expect("campaign raised total overflow");
+        env.storage()
+            .persistent()
+            .set(&DataKey::CampaignRaised(campaign_id), &new_total);
 
         campaign_client.update_raised(&campaign_id, &amount);
+        guard::release(&env);
 
         if anonymous {
             env.events().publish(
@@ -158,6 +175,9 @@ impl DonationContract {
     }
 
     pub fn refund(env: Env, caller: Address, campaign_id: u64, donor: Address, amount: i128, token: Address) {
+        // Guard first (#762): this is the contract's `request_refund` path and
+        // it moves funds out of the contract.
+        guard::acquire(&env);
         caller.require_auth();
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         let campaign_contract: Address = env.storage().instance().get(&DataKey::CampaignContract).unwrap();
@@ -174,11 +194,16 @@ impl DonationContract {
         if amount > total {
             panic!("refund amount exceeds total raised");
         }
-        env.storage().persistent().set(&DataKey::CampaignRaised(campaign_id), &(total - amount));
+        // Checked subtraction (#760).
+        let new_total = total.checked_sub(amount).expect("campaign raised total underflow");
+        env.storage()
+            .persistent()
+            .set(&DataKey::CampaignRaised(campaign_id), &new_total);
 
         let token_client = token::Client::new(&env, &token);
         token_client.transfer(&env.current_contract_address(), &donor, &amount);
 
+        guard::release(&env);
         env.events().publish(
             (Symbol::new(&env, "donation_refunded"),),
             DonationRefundedEvent {
