@@ -5,7 +5,12 @@ extern crate std;
 
 use shared::pause;
 use shared::types::{Campaign, CampaignStatus};
-use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env, String, Symbol};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, token, Address, BytesN, Env, String, Symbol,
+};
+
+pub mod balance;
+pub mod sanitize;
 
 #[contracttype]
 #[derive(Clone)]
@@ -17,6 +22,42 @@ pub enum DataKey {
     Frozen,
     UnderReview,
     ReviewReason,
+    /// Human-readable asset code a campaign accepts donations in, bounded to
+    /// `sanitize::MAX_ASSET_CODE_LEN` bytes (#765).
+    CampaignAsset(u64),
+    /// One evidence entry on a campaign's open dispute, as
+    /// `(submitter, hash)` (#765: free-form text is hashed, never stored).
+    DisputeEvidence(u64, u32),
+    /// Number of evidence entries recorded for a campaign (#763).
+    DisputeEvidenceCount(u64),
+    /// `true` once `actor` has donated to `campaign_id`. Backs the
+    /// "donor or creator" authorization rule for disputes (#763).
+    CampaignDonor(u64, Address),
+}
+
+/// Maximum number of evidence entries a single dispute may accumulate (#763).
+/// Bounded so a dispute cannot grow persistent storage without limit.
+const MAX_DISPUTE_EVIDENCE: u32 = 32;
+
+/// One evidence entry on a campaign's dispute.
+///
+/// The submission is a `BytesN<32>` digest rather than the text itself: on-chain
+/// storage is priced per byte and is permanent, so an unbounded `String` in a
+/// record is a permanent liability for whoever wrote it (#765).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisputeEvidenceEntry {
+    pub submitter: Address,
+    pub evidence_hash: BytesN<32>,
+}
+
+/// `contract_upgraded` -- emitted after the contract's WASM is replaced (#767).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContractUpgradedEvent {
+    pub admin: Address,
+    pub new_wasm_hash: BytesN<32>,
+    pub ledger: u32,
 }
 
 #[contracttype]
@@ -172,6 +213,10 @@ impl CampaignContract {
             .expect("contract not initialized");
         admin.require_auth();
 
+        // #765: a zero hash is what an uninitialised buffer looks like, so it
+        // must not satisfy the "a reason was provided" contract.
+        let reason_hash = sanitize::require_reason_hash(&env, &reason_hash);
+
         env.storage().instance().set(&DataKey::UnderReview, &true);
         env.storage()
             .instance()
@@ -286,6 +331,41 @@ impl CampaignContract {
         id
     }
 
+    /// Record the asset code a campaign accepts donations in (#765).
+    ///
+    /// Creator-only. The code is bounded to `MAX_ASSET_CODE_LEN` (12) bytes
+    /// before it is written, so no empty or over-length code can reach
+    /// persistent storage, an indexer, or a wallet. A `String` is the right
+    /// shape here precisely because it is bounded: an asset code has to stay
+    /// readable on chain.
+    pub fn set_campaign_asset_code(
+        env: Env,
+        owner: Address,
+        campaign_id: u64,
+        asset_code: String,
+    ) {
+        Self::require_not_frozen(&env);
+        pause::require_not_paused(&env);
+        let campaign = Self::get_campaign(env.clone(), campaign_id).expect("campaign not found");
+        owner.require_auth();
+        if owner != campaign.owner {
+            panic!("unauthorized: only the campaign creator may set the asset code");
+        }
+
+        let bounded = sanitize::require_asset_code(&env, &asset_code);
+        env.storage()
+            .persistent()
+            .set(&DataKey::CampaignAsset(campaign_id), &bounded);
+        Self::bump_campaign_ttl(env.clone(), campaign_id);
+    }
+
+    /// Get the asset code a campaign accepts donations in, if one is set.
+    pub fn get_campaign_asset_code(env: Env, campaign_id: u64) -> Option<String> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CampaignAsset(campaign_id))
+    }
+
     /// Get campaign details by ID.
     pub fn get_campaign(env: Env, campaign_id: u64) -> Option<Campaign> {
         env.storage()
@@ -318,6 +398,26 @@ impl CampaignContract {
                 new_status,
             },
         );
+    }
+
+    /// Register `donor` as a donor of `campaign_id`.
+    ///
+    /// Called by the donation contract once a donation's token transfer has
+    /// settled. The marker is what backs the "donor or creator" authorization
+    /// rule for the dispute entry points (#763): without it the contract has no
+    /// way to tell a donor from a stranger, because donations are recorded in
+    /// the donation contract's own storage.
+    pub fn record_donor(env: Env, campaign_id: u64, donor: Address) {
+        Self::require_not_frozen(&env);
+        env.storage()
+            .persistent()
+            .set(&DataKey::CampaignDonor(campaign_id, donor), &true);
+        Self::bump_campaign_ttl(env, campaign_id);
+    }
+
+    /// Whether `actor` has been recorded as a donor of `campaign_id`.
+    pub fn has_recorded_donor(env: Env, campaign_id: u64, donor: Address) -> bool {
+        Self::has_donated(&env, campaign_id, &donor)
     }
 
     /// Increment the raised amount for a campaign. Called via cross-contract
@@ -382,10 +482,9 @@ impl CampaignContract {
         pause::require_not_paused(&env);
         admin.require_auth();
         Self::ensure_admin(&env, &admin);
-        // ── Input length validation (closes #591) ──────────────────────────
-        if reason.len() > MAX_STRING_INPUT_LEN {
-            panic!("reason exceeds maximum allowed length");
-        }
+        // ── Input length validation (closes #591 / #765) ─────────────────
+        // Bounded before any write, so no unbounded `String` reaches storage.
+        let reason = sanitize::require_bounded(&env, &reason, MAX_STRING_INPUT_LEN, "reason");
         let mut campaign = Self::get_campaign(env.clone(), campaign_id).unwrap();
         let old_status = campaign.status;
         campaign.status = CampaignStatus::Rejected;
@@ -401,6 +500,112 @@ impl CampaignContract {
             },
         );
         let _ = reason;
+    }
+
+    /// Attach a hashed evidence entry to a campaign's dispute (#763, #765).
+    ///
+    /// Authorized to the campaign creator or to a donor of that campaign.
+    /// Evidence is stored as a `BytesN<32>` digest, never as free-form text, and
+    /// the number of entries per campaign is capped at `MAX_DISPUTE_EVIDENCE`
+    /// so a dispute cannot grow persistent storage without limit.
+    pub fn add_dispute_evidence(
+        env: Env,
+        campaign_id: u64,
+        submitter: Address,
+        evidence_hash: BytesN<32>,
+    ) {
+        Self::require_not_frozen(&env);
+        pause::require_not_paused(&env);
+        submitter.require_auth();
+
+        let campaign = Self::get_campaign(env.clone(), campaign_id).expect("campaign not found");
+        if campaign.owner != submitter && !Self::has_donated(&env, campaign_id, &submitter) {
+            panic!("unauthorized: only the campaign creator or a donor may add evidence");
+        }
+        let evidence_hash = sanitize::require_reason_hash(&env, &evidence_hash);
+
+        let count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DisputeEvidenceCount(campaign_id))
+            .unwrap_or(0_u32);
+        if count >= MAX_DISPUTE_EVIDENCE {
+            panic!("dispute evidence limit reached");
+        }
+
+        env.storage().persistent().set(
+            &DataKey::DisputeEvidence(campaign_id, count),
+            &DisputeEvidenceEntry {
+                submitter,
+                evidence_hash,
+            },
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::DisputeEvidenceCount(campaign_id), &count + 1);
+        Self::bump_campaign_ttl(env.clone(), campaign_id);
+    }
+
+    /// Number of evidence entries recorded against a campaign's dispute.
+    pub fn get_dispute_evidence_count(env: Env, campaign_id: u64) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::DisputeEvidenceCount(campaign_id))
+            .unwrap_or(0_u32)
+    }
+
+    /// Payout path for a finalized withdrawal (#764).
+    ///
+    /// Creator-only. The contract's token balance is verified *before* any state
+    /// write and inside the same invocation as the transfer, so a doomed payout
+    /// never half-applies and a concurrent drain cannot slip between the check
+    /// and the transfer.
+    pub fn finalize_payout(
+        env: Env,
+        campaign_id: u64,
+        amount: i128,
+        token_address: Address,
+        recipient: Address,
+    ) {
+        Self::require_not_frozen(&env);
+        Self::require_not_under_review(&env);
+        pause::require_not_paused(&env);
+
+        let mut campaign =
+            Self::get_campaign(env.clone(), campaign_id).expect("campaign not found");
+        campaign.owner.require_auth();
+        if recipient != campaign.owner {
+            panic!("unauthorized: funds may only be paid out to the campaign creator");
+        }
+        if amount <= 0 {
+            panic!("payout amount must be positive");
+        }
+
+        // Accounting first: the campaign must have raised the money...
+        if amount > campaign.raised {
+            panic!("insufficient funds: requested exceeds raised amount");
+        }
+        // ...and the contract's wallet must actually hold it, verified before
+        // the debit is persisted (#764).
+        balance::require_contract_balance(&env, &token_address, amount);
+
+        campaign.raised -= amount;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Campaign(campaign_id), &campaign);
+        Self::bump_campaign_ttl(env.clone(), campaign_id);
+
+        token::Client::new(&env, &token_address).transfer(
+            &env.current_contract_address(),
+            &recipient,
+            &amount,
+        );
+    }
+
+    /// Whether the contract currently holds at least `amount` of
+    /// `token_address`. Read-only view over the payout pre-check (#764).
+    pub fn can_cover_payout(env: Env, token_address: Address, amount: i128) -> bool {
+        balance::can_cover(&env, &token_address, amount)
     }
 
     /// Suspend a campaign, moving it to Suspended status.
@@ -462,11 +667,34 @@ impl CampaignContract {
     }
 
     /// Upgrade the contract to a new WASM implementation.
-    pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) {
+    ///
+    /// Admin-gated (#767). The caller is deliberately **not** a parameter: the
+    /// only address that can authorize an upgrade is the `admin` recorded at
+    /// `initialize`, so the authorized set cannot be widened by a caller who
+    /// supplies a matching `admin` argument. The stored admin must sign.
+    ///
+    /// Emits `contract_upgraded` with the new WASM hash and the ledger, so an
+    /// upgrade is attributable in the event stream even when it lands outside a
+    /// scheduled maintenance window.
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
         Self::require_not_frozen(&env);
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("contract not initialized");
         admin.require_auth();
-        Self::ensure_admin(&env, &admin);
+
         env.deployer().update_current_contract_wasm(new_wasm_hash);
+
+        env.events().publish(
+            (Symbol::new(&env, "contract_upgraded"),),
+            ContractUpgradedEvent {
+                admin,
+                new_wasm_hash,
+                ledger: env.ledger().sequence(),
+            },
+        );
     }
 
     /// Bumps the TTL of a campaign to ensure it doesn't expire.
@@ -538,6 +766,18 @@ impl CampaignContract {
         }
     }
 
+    /// Whether `actor` has been recorded as a donor of `campaign_id`.
+    ///
+    /// Backs the "donor or creator" authorization rule for the dispute entry
+    /// points (#763). The donation contract records the marker after a settled
+    /// token transfer, so it is only ever set for a real donation.
+    fn has_donated(env: &Env, campaign_id: u64, actor: &Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CampaignDonor(campaign_id, actor.clone()))
+            .unwrap_or(false)
+    }
+
     fn next_campaign_id(env: &Env) -> u64 {
         let mut next_id: u64 = env
             .storage()
@@ -551,7 +791,9 @@ impl CampaignContract {
         next_id
     }
 
-    // ── Health monitoring (#678) and gradual rollout (#684) ──────────────
+// ── Health monitoring (#678) and gradual rollout (#684) ──────────────
+// Authorization: every setter in this block is admin-only and is enforced by
+// an identity check against the admin stored at initialization (#763).
     pub fn health_check(env: Env) -> shared::health::HealthReport {
         let report = shared::health::health_check(&env);
         if report.anomaly {
@@ -569,6 +811,10 @@ impl CampaignContract {
     pub fn set_alert_config(env: Env, admin: Address, config: shared::health::AlertConfig) {
         Self::require_not_frozen(&env);
         admin.require_auth();
+        // #763: `admin.require_auth()` alone accepts *any* address. Without this
+        // identity check against the stored admin, any account can reach this
+        // entry point by naming itself as `admin`.
+        Self::ensure_admin(&env, &admin);
         shared::health::set_alert_config(&env, config);
     }
     pub fn get_alert_config(env: Env) -> shared::health::AlertConfig {
@@ -580,16 +826,28 @@ impl CampaignContract {
     pub fn report_ok(env: Env, admin: Address) {
         Self::require_not_frozen(&env);
         admin.require_auth();
+        // #763: `admin.require_auth()` alone accepts *any* address. Without this
+        // identity check against the stored admin, any account can reach this
+        // entry point by naming itself as `admin`.
+        Self::ensure_admin(&env, &admin);
         shared::health::record_ok(&env);
     }
     pub fn report_error(env: Env, admin: Address) {
         Self::require_not_frozen(&env);
         admin.require_auth();
+        // #763: `admin.require_auth()` alone accepts *any* address. Without this
+        // identity check against the stored admin, any account can reach this
+        // entry point by naming itself as `admin`.
+        Self::ensure_admin(&env, &admin);
         shared::health::record_error(&env);
     }
     pub fn set_feature_flag(env: Env, admin: Address, flag: soroban_sdk::Symbol, enabled: bool) {
         Self::require_not_frozen(&env);
         admin.require_auth();
+        // #763: `admin.require_auth()` alone accepts *any* address. Without this
+        // identity check against the stored admin, any account can reach this
+        // entry point by naming itself as `admin`.
+        Self::ensure_admin(&env, &admin);
         shared::rollout::set_feature_flag(&env, &flag, enabled);
     }
     pub fn is_feature_enabled(env: Env, flag: soroban_sdk::Symbol) -> bool {
@@ -604,6 +862,10 @@ impl CampaignContract {
     ) {
         Self::require_not_frozen(&env);
         admin.require_auth();
+        // #763: `admin.require_auth()` alone accepts *any* address. Without this
+        // identity check against the stored admin, any account can reach this
+        // entry point by naming itself as `admin`.
+        Self::ensure_admin(&env, &admin);
         shared::rollout::set_canary_deployment(&env, canary, stable, canary_bps);
     }
     pub fn route_to_canary(env: Env, caller: Address) -> bool {
@@ -615,6 +877,10 @@ impl CampaignContract {
     pub fn set_rollback_trigger(env: Env, admin: Address, error_bps: u32) {
         Self::require_not_frozen(&env);
         admin.require_auth();
+        // #763: `admin.require_auth()` alone accepts *any* address. Without this
+        // identity check against the stored admin, any account can reach this
+        // entry point by naming itself as `admin`.
+        Self::ensure_admin(&env, &admin);
         shared::rollout::set_rollback_trigger(&env, error_bps);
     }
     pub fn should_rollback(env: Env) -> bool {
@@ -623,10 +889,16 @@ impl CampaignContract {
     pub fn trigger_rollback(env: Env, admin: Address) {
         Self::require_not_frozen(&env);
         admin.require_auth();
+        // #763: `admin.require_auth()` alone accepts *any* address. Without this
+        // identity check against the stored admin, any account can reach this
+        // entry point by naming itself as `admin`.
+        Self::ensure_admin(&env, &admin);
         shared::rollout::trigger_rollback(&env, &admin);
     }
 }
 
+#[cfg(test)]
+mod auth_tests;
 #[cfg(test)]
 mod invariant_tests;
 #[cfg(test)]
@@ -780,7 +1052,7 @@ mod test {
         assert!(res_set_admin.is_err());
 
         let res_upgrade = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            client.upgrade(&admin, &BytesN::from_array(&env, &[0u8; 32]));
+            client.upgrade(&BytesN::from_array(&env, &[0u8; 32]));
         }));
         assert!(res_upgrade.is_err());
 

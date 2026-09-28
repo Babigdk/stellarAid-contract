@@ -123,9 +123,16 @@ impl WithdrawalContract {
             panic!("insufficient funds: requested exceeds available balance");
         }
 
+        // #764: verify the contract's balance *before* any state is written,
+        // and in the same invocation as the transfer below. The previous code
+        // wrote `approved = true` and bumped `WithdrawnAmount` first, so a
+        // short balance left a withdrawal marked approved and the running total
+        // inflated with an amount that was never paid out.
         let token_client = token::Client::new(&env, &token);
         if token_client.balance(&env.current_contract_address()) < withdrawal.amount {
-            panic!("insufficient funds: contract balance is lower than requested amount");
+            // Named to match `campaign::balance::INSUFFICIENT_CONTRACT_BALANCE`
+            // and the typed `Error::InsufficientContractBalance`.
+            panic!("InsufficientContractBalance");
         }
 
         let mut updated = withdrawal.clone();
@@ -145,6 +152,8 @@ impl WithdrawalContract {
         pause::require_not_paused(&env);
         admin.require_auth();
         Self::ensure_admin(&env, &admin);
+        // #765: bound the reason before it is attached to the event payload.
+        shared::validation::require_string_len(&reason, shared::validation::MAX_MEMO_LEN, "reason");
         let withdrawal = env.storage().persistent().get::<DataKey, Withdrawal>(&DataKey::Withdrawal(withdrawal_id)).unwrap();
         let _ = withdrawal;
         env.events().publish((Symbol::new(&env, "withdrawal_rejected"),), WithdrawalRejectedEvent { withdrawal_id, reason });
@@ -185,7 +194,9 @@ impl WithdrawalContract {
         next_id
     }
 
-    // ── Health monitoring (#678) and gradual rollout (#684) ──────────────
+// ── Health monitoring (#678) and gradual rollout (#684) ──────────────
+// Authorization: every setter in this block is admin-only and is enforced by
+// an identity check against the admin stored at initialization (#763).
     pub fn health_check(env: Env) -> shared::health::HealthReport {
         let report = shared::health::health_check(&env);
         if report.anomaly {
@@ -202,6 +213,10 @@ impl WithdrawalContract {
     }
     pub fn set_alert_config(env: Env, admin: Address, config: shared::health::AlertConfig) {
         admin.require_auth();
+        // #763: `admin.require_auth()` alone accepts *any* address. Without this
+        // identity check against the stored admin, any account can reach this
+        // entry point by naming itself as `admin`.
+        Self::ensure_admin(&env, &admin);
         shared::health::set_alert_config(&env, config);
     }
     pub fn get_alert_config(env: Env) -> shared::health::AlertConfig {
@@ -212,14 +227,26 @@ impl WithdrawalContract {
     }
     pub fn report_ok(env: Env, admin: Address) {
         admin.require_auth();
+        // #763: `admin.require_auth()` alone accepts *any* address. Without this
+        // identity check against the stored admin, any account can reach this
+        // entry point by naming itself as `admin`.
+        Self::ensure_admin(&env, &admin);
         shared::health::record_ok(&env);
     }
     pub fn report_error(env: Env, admin: Address) {
         admin.require_auth();
+        // #763: `admin.require_auth()` alone accepts *any* address. Without this
+        // identity check against the stored admin, any account can reach this
+        // entry point by naming itself as `admin`.
+        Self::ensure_admin(&env, &admin);
         shared::health::record_error(&env);
     }
     pub fn set_feature_flag(env: Env, admin: Address, flag: soroban_sdk::Symbol, enabled: bool) {
         admin.require_auth();
+        // #763: `admin.require_auth()` alone accepts *any* address. Without this
+        // identity check against the stored admin, any account can reach this
+        // entry point by naming itself as `admin`.
+        Self::ensure_admin(&env, &admin);
         shared::rollout::set_feature_flag(&env, &flag, enabled);
     }
     pub fn is_feature_enabled(env: Env, flag: soroban_sdk::Symbol) -> bool {
@@ -227,6 +254,10 @@ impl WithdrawalContract {
     }
     pub fn set_canary_deployment(env: Env, admin: Address, canary: Address, stable: Address, canary_bps: u32) {
         admin.require_auth();
+        // #763: `admin.require_auth()` alone accepts *any* address. Without this
+        // identity check against the stored admin, any account can reach this
+        // entry point by naming itself as `admin`.
+        Self::ensure_admin(&env, &admin);
         shared::rollout::set_canary_deployment(&env, canary, stable, canary_bps);
     }
     pub fn route_to_canary(env: Env, caller: Address) -> bool {
@@ -237,6 +268,10 @@ impl WithdrawalContract {
     }
     pub fn set_rollback_trigger(env: Env, admin: Address, error_bps: u32) {
         admin.require_auth();
+        // #763: `admin.require_auth()` alone accepts *any* address. Without this
+        // identity check against the stored admin, any account can reach this
+        // entry point by naming itself as `admin`.
+        Self::ensure_admin(&env, &admin);
         shared::rollout::set_rollback_trigger(&env, error_bps);
     }
     pub fn should_rollback(env: Env) -> bool {
@@ -244,6 +279,10 @@ impl WithdrawalContract {
     }
     pub fn trigger_rollback(env: Env, admin: Address) {
         admin.require_auth();
+        // #763: `admin.require_auth()` alone accepts *any* address. Without this
+        // identity check against the stored admin, any account can reach this
+        // entry point by naming itself as `admin`.
+        Self::ensure_admin(&env, &admin);
         shared::rollout::trigger_rollback(&env, &admin);
     }
 }

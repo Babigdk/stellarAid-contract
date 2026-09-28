@@ -152,6 +152,11 @@ impl DisputeArbiter {
     ) -> Result<(), DisputeError> {
         let admin = get_admin(&env)?;
         admin.require_auth();
+        // #765: the note is written to persistent storage, so bound it before
+        // the escrow refund rather than after it.
+        if note.len() > shared::validation::MAX_MEMO_LEN {
+            return Err(DisputeError::NoteTooLong);
+        }
         let mut record = load_dispute(&env, &commission_id)?;
         if record.status != DisputeStatus::Open {
             return Err(DisputeError::InvalidStatus);
@@ -178,6 +183,11 @@ impl DisputeArbiter {
     ) -> Result<(), DisputeError> {
         let admin = get_admin(&env)?;
         admin.require_auth();
+        // #765: the note is written to persistent storage, so bound it before
+        // the escrow release rather than after it.
+        if note.len() > shared::validation::MAX_MEMO_LEN {
+            return Err(DisputeError::NoteTooLong);
+        }
         let mut record = load_dispute(&env, &commission_id)?;
         if record.status != DisputeStatus::Open {
             return Err(DisputeError::InvalidStatus);
@@ -207,6 +217,11 @@ impl DisputeArbiter {
         admin.require_auth();
         if client_share_bps > 10000 {
             return Err(DisputeError::InvalidShareBps);
+        }
+        // #765: the note is written to persistent storage, so bound it before
+        // the escrow refund and the transfers rather than after them.
+        if note.len() > shared::validation::MAX_MEMO_LEN {
+            return Err(DisputeError::NoteTooLong);
         }
         let mut record = load_dispute(&env, &commission_id)?;
         if record.status != DisputeStatus::Open {
