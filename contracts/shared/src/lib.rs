@@ -1,6 +1,7 @@
 #![no_std]
 pub mod config;
 pub mod errors;
+pub mod guard;
 pub mod pause;
 pub mod types;
 pub mod upgrade;
